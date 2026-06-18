@@ -1,0 +1,12 @@
+[
+{
+  "directory": "/data1/yuquan/PartNet/ref_pose/mycpp/build",
+  "command": "/data1/yuquan/miniconda3/envs/sam3d-objects/bin/x86_64-conda-linux-gnu-c++ -DBOOST_PROGRAM_OPTIONS_DYN_LINK -DBOOST_PROGRAM_OPTIONS_NO_LIB -DBOOST_SYSTEM_DYN_LINK -DBOOST_SYSTEM_NO_LIB -Dmycpp_EXPORTS -I/data1/yuquan/PartNet/ref_pose/mycpp/include -isystem /data1/yuquan/miniconda3/envs/sam3d-objects/lib/python3.11/site-packages/pybind11/include -isystem /data1/yuquan/miniconda3/envs/sam3d-objects/include/python3.11 -isystem /data1/yuquan/miniconda3/envs/sam3d-objects/include/eigen3 -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /data1/yuquan/miniconda3/envs/sam3d-objects/include  -I/data1/yuquan/miniconda3/envs/sam3d-objects/targets/x86_64-linux/include  -L/data1/yuquan/miniconda3/envs/sam3d-objects/targets/x86_64-linux/lib -L/data1/yuquan/miniconda3/envs/sam3d-objects/targets/x86_64-linux/lib/stubs -std=c++14 -fopenmp -g3 -O3 -O3 -DNDEBUG -fPIC -fvisibility=hidden -flto -fno-fat-lto-objects -o CMakeFiles/mycpp.dir/src/app/pybind_api.cpp.o -c /data1/yuquan/PartNet/ref_pose/mycpp/src/app/pybind_api.cpp",
+  "file": "/data1/yuquan/PartNet/ref_pose/mycpp/src/app/pybind_api.cpp"
+},
+{
+  "directory": "/data1/yuquan/PartNet/ref_pose/mycpp/build",
+  "command": "/data1/yuquan/miniconda3/envs/sam3d-objects/bin/x86_64-conda-linux-gnu-c++ -DBOOST_PROGRAM_OPTIONS_DYN_LINK -DBOOST_PROGRAM_OPTIONS_NO_LIB -DBOOST_SYSTEM_DYN_LINK -DBOOST_SYSTEM_NO_LIB -Dmycpp_EXPORTS -I/data1/yuquan/PartNet/ref_pose/mycpp/include -isystem /data1/yuquan/miniconda3/envs/sam3d-objects/lib/python3.11/site-packages/pybind11/include -isystem /data1/yuquan/miniconda3/envs/sam3d-objects/include/python3.11 -isystem /data1/yuquan/miniconda3/envs/sam3d-objects/include/eigen3 -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /data1/yuquan/miniconda3/envs/sam3d-objects/include  -I/data1/yuquan/miniconda3/envs/sam3d-objects/targets/x86_64-linux/include  -L/data1/yuquan/miniconda3/envs/sam3d-objects/targets/x86_64-linux/lib -L/data1/yuquan/miniconda3/envs/sam3d-objects/targets/x86_64-linux/lib/stubs -std=c++14 -fopenmp -g3 -O3 -O3 -DNDEBUG -fPIC -fvisibility=hidden -flto -fno-fat-lto-objects -o CMakeFiles/mycpp.dir/src/Utils.cpp.o -c /data1/yuquan/PartNet/ref_pose/mycpp/src/Utils.cpp",
+  "file": "/data1/yuquan/PartNet/ref_pose/mycpp/src/Utils.cpp"
+}
+]

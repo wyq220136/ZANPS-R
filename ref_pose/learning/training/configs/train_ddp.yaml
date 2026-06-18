@@ -1,0 +1,97 @@
+dataset_root: "/inspire/hdd/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/dataset_train"
+train_subdir: "train"
+val_subdir: "val"
+recon_cache_root: "/inspire/hdd/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/dataset_train_recon_cache"
+sam3d_project_root: "/inspire/hdd/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/sam-3d-objects"
+sam3d_notebook_root: "/inspire/hdd/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/sam-3d-objects/notebook"
+sam3d_config_path: null
+min_mask_pixels: 32
+depth_scale: 1000.0
+
+# Refiner config (model architecture/training conventions).
+config: null
+
+# Checkpoint/output paths.
+out_dir: "/inspire/hdd/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/ref_pose/learning/weights/refine_validmask_ddp"
+loss_history_json_path: "/inspire/hdd/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/ref_pose/train_refine_validity_mask_ddp_loss_history.json"
+exit_log_jsonl_path: ""
+auto_resume: true
+
+# Training schedule.
+epochs: 20
+iterations: 5
+lr: 0.0001
+weight_decay: 0.0001
+log_every: 10
+disable_tqdm: false
+seed: 42
+
+# Dataloader.
+batch_size: 1
+batch_size_per_rank: ""
+num_workers: 0
+num_workers_per_rank: ""
+pin_memory: true
+persistent_workers: true
+
+# Reconstruction prebuild.
+prebuild_recon: true
+prebuild_split: "both"
+recon_num_workers: 0
+recon_num_workers_per_rank: ""
+recon_persistent_workers: false
+force_rebuild_recon: false
+force_resample_recon: false
+use_real_depth_pointmap: true
+recon_min_views_per_part: 3
+recon_max_views_per_part: 5
+recon_rot_threshold_deg: 15.0
+recon_trans_threshold: 0.05
+recon_model: "sam3d"
+recon_view_density_scale: 1.5
+
+# Hunyuan3D backend.
+hunyuan_model_path: "/inspire/hdd/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/Hunyuan3D-2.1/ckpts"
+hunyuan_subfolder: "hunyuan3d-dit-v2-1"
+hunyuan_num_inference_steps: 50
+hunyuan_octree_resolution: 384
+hunyuan_guidance_scale: 5.5
+
+# InstantMesh backend.
+instantmesh_root: "/inspire/hdd/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/InstantMesh"
+instantmesh_config_path: "/inspire/hdd/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/InstantMesh/configs/instant-mesh-large.yaml"
+instantmesh_diffusion_model: "sudo-ai/zero123plus-v1.2"
+instantmesh_unet_path: ""
+instantmesh_model_path: ""
+instantmesh_diffusion_steps: 75
+instantmesh_scale: 1.0
+instantmesh_view: 6
+instantmesh_foreground_ratio: 0.85
+instantmesh_export_texmap: false
+
+# Trainable modules.
+train_pose_backbone: false
+train_adapters: false
+
+# Loss and utility settings.
+soft_alpha: 8.0
+soft_gamma: 2.0
+soft_delta: 1.0
+aux_bce_weight: 0.02
+pose_utility_scale: 10.0
+vm_weight: 0.75
+
+# Early stopping.
+early_stop_patience: 10
+early_stop_min_delta: 0.000001
+
+# Checkpoint naming. If false, vm_weight tag is appended to out_dir and ckpt names.
+disable_vm_weight_naming: false
+
+# torchrun fallback.
+backend: "nccl"
+master_addr: "127.0.0.1"
+master_port: 29500
+world_size: 1
+rank: 0
+local_rank: 0
