@@ -1,0 +1,7 @@
+openai==1.55.3
+python-dotenv==1.0.1
+scipy==1.11.4
+Pillow==10.4.0
+
+# Imported by eccv/segmentation/sam_utils.py for optional visualization helpers.
+matplotlib==3.8.4
