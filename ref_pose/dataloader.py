@@ -1,6 +1,10 @@
 from Utils import *
 import json,os,sys,re
 from learning.training.predict_score import *
+try:
+  from reference_evidence import load_reference_evidence
+except Exception:
+  from ref_pose.reference_evidence import load_reference_evidence
  
  
 BOP_LIST = ['lmo','tless','ycbv','hb','tudl','icbin','itodd']
@@ -205,6 +209,8 @@ class SingleLoader:
     self.masks = []
     self.part_ids = []
     self.init_poses = []
+    self.model_dirs = []
+    self.reference_evidence = []
 
     entries = []
     for name in sorted(os.listdir(mesh_dir), key=natural_sort_key):
@@ -237,13 +243,16 @@ class SingleLoader:
         except Exception as e:
           logging.warning(f"Failed to read raw pose for part {part_id}: {raw_pose_path}, err={e}")
 
-      entries.append((part_id, model_path, mask_path, init_pose))
+      ref_evidence = load_reference_evidence(model_dir)
+      entries.append((part_id, model_path, mask_path, init_pose, model_dir, ref_evidence))
 
     entries.sort(key=lambda x: x[0])
     self.part_ids = [e[0] for e in entries]
     self.models = [e[1] for e in entries]
     self.masks = [e[2] for e in entries]
     self.init_poses = [e[3] for e in entries]
+    self.model_dirs = [e[4] for e in entries]
+    self.reference_evidence = [e[5] for e in entries]
     
     self.H, self.W = cv2.imread(rgb_path).shape[:2]
     self.rgb_path = rgb_path
@@ -265,6 +274,32 @@ class SingleLoader:
     if i < 0 or i >= len(self.init_poses):
       return np.eye(4, dtype=np.float32)
     return self.init_poses[i]
+
+  def get_model_dir(self, i):
+    if i < 0 or i >= len(self.model_dirs):
+      return ""
+    return self.model_dirs[i]
+
+  def get_reference_evidence(self, i):
+    if i < 0 or i >= len(self.reference_evidence):
+      return {"available": False}
+    return self.reference_evidence[i]
+
+  def get_reference_points(self, i, frame="object"):
+    evidence = self.get_reference_evidence(i)
+    if frame in ("object", "obj"):
+      return evidence.get("points_obj", None)
+    if frame in ("camera", "cam"):
+      return evidence.get("points_cam", None)
+    return evidence.get("points", None)
+
+  def get_reference_transforms(self, i):
+    evidence = self.get_reference_evidence(i)
+    return {
+      "raw_pose": evidence.get("raw_pose", None),
+      "local_to_object": evidence.get("local_to_object", None),
+      "local_to_reference_camera": evidence.get("local_to_reference_camera", None),
+    }
  
  
 class BopBaseReader:

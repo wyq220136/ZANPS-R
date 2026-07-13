@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import math
 import os
@@ -188,6 +189,33 @@ def _parse_per_rank_value(raw: str, default_v: int, world_size: int):
     return [int(v) for v in vals]
 
 
+def _recon_uses_gpu_model(recon_model: str) -> bool:
+    model = str(recon_model).lower().strip()
+    return model in (
+        "sam3d",
+        "sam3d_tsdf",
+        "sam3d_tsdf_dmesh",
+        "hunyuan3d",
+        "hunyuan3d_tsdf",
+        "hunyuan3d_tsdf_dmesh",
+        "instantmesh",
+        "instantmesh_tsdf",
+        "instantmesh_tsdf_dmesh",
+        "all",
+    )
+
+
+def _cap_gpu_recon_workers_per_rank(recon_workers_per_rank: List[int], recon_model: str) -> List[int]:
+    normalized = [max(1, int(v)) for v in recon_workers_per_rank]
+    if _recon_uses_gpu_model(recon_model) and _is_main_process():
+        print(
+            "[prebuild] GPU reconstruction worker layout: "
+            f"recon_model={recon_model} recon_workers_per_rank={normalized}",
+            flush=True,
+        )
+    return normalized
+
+
 class DistributedAlignedBatchSampler(Sampler[List[int]]):
     def __init__(
         self,
@@ -338,6 +366,12 @@ def _enable_trainable_params(model: RefineNet, train_pose_backbone: bool = False
         for _, p in model.encodeAB_adapters.named_parameters():
             p.requires_grad = True
 
+    if getattr(model, "enable_ref_coord", False):
+        for _, p in model.coord_head.named_parameters():
+            p.requires_grad = True
+        for _, p in model.coord_conf_head.named_parameters():
+            p.requires_grad = True
+
 
 def _build_optimizer(model: RefineNet, base_lr: float, weight_decay: float):
     decoder_params = []
@@ -350,6 +384,8 @@ def _build_optimizer(model: RefineNet, base_lr: float, weight_decay: float):
             adapter_params.append(p)
         elif name.startswith("encodeAB.3.") or name.startswith("encodeAB.4."):
             block_params.append(p)
+        elif name.startswith("coord_head.") or name.startswith("coord_conf_head."):
+            decoder_params.append(p)
         else:
             decoder_params.append(p)
     groups = [
@@ -536,6 +572,55 @@ def _load_mesh_keep_visual(mesh_path: str):
     return m
 
 
+def _load_deferred_sample_io(sample: Dict[str, Any]) -> Dict[str, Any]:
+    if "rgb" in sample and "mask" in sample and "depth" in sample and "K" in sample:
+        return sample
+    required = ("rgb_path", "mask_path", "depth_path", "K_path")
+    if not all(k in sample for k in required):
+        return sample
+
+    mask = cv2.imread(sample["mask_path"], cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise RuntimeError(f"failed to read mask: {sample['mask_path']}")
+    min_mask_pixels = int(sample.get("min_mask_pixels", 1))
+    valid_pixels = int(np.count_nonzero(mask > 0))
+    if valid_pixels < min_mask_pixels:
+        raise RuntimeError(f"mask has too few valid pixels ({valid_pixels}) in {sample['mask_path']}")
+
+    rgb = cv2.imread(sample["rgb_path"], cv2.IMREAD_COLOR)
+    if rgb is None:
+        raise RuntimeError(f"failed to read rgb: {sample['rgb_path']}")
+    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB).astype(np.float32)
+    mask_bin = (mask > 0).astype(np.uint8)
+
+    depth_path = sample["depth_path"]
+    ext = os.path.splitext(depth_path)[1].lower()
+    if ext == ".npy":
+        depth = np.load(depth_path).astype(np.float32)
+    else:
+        depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            raise RuntimeError(f"failed to read depth: {depth_path}")
+        depth = depth.astype(np.float32)
+    if depth.size == 0:
+        raise RuntimeError(f"empty depth map: {depth_path}")
+    if np.nanmax(depth) > 100.0:
+        depth = depth / max(float(sample.get("depth_scale", 1000.0)), 1.0)
+    depth[~np.isfinite(depth)] = 0.0
+    depth[depth < 0.0] = 0.0
+    if depth.shape[:2] != mask_bin.shape[:2]:
+        raise RuntimeError(
+            f"depth/mask shape mismatch: depth={depth.shape} mask={mask_bin.shape} file={depth_path}"
+        )
+
+    loaded = dict(sample)
+    loaded["rgb"] = rgb
+    loaded["mask"] = mask_bin
+    loaded["depth"] = depth.astype(np.float32)
+    loaded["K"] = np.loadtxt(sample["K_path"], dtype=np.float32).reshape(3, 3)
+    return loaded
+
+
 @dataclass
 class LossOutput:
     loss: torch.Tensor
@@ -581,6 +666,7 @@ def _compute_batch_loss(
 ):
     sample_cache = []
     for sample in samples:
+        sample = _load_deferred_sample_io(sample)
         gt_mesh = _load_mesh_keep_visual(sample["gt_mesh_path"])
         gt_tensors = make_mesh_tensors(gt_mesh)
         recon_mesh_paths = sample.get("recon_mesh_paths", None)
@@ -951,8 +1037,37 @@ def _log_exit_event(args, reason: str, detail: str = "", epoch: Optional[int] = 
         print(f"[exit] failed to write exit log {path}: {e}", flush=True)
 
 
-def _make_prebuild_dataset(args, root, split_name: str):
-    return Sam3DPartTrainDataset(
+def _make_sam3d_part_dataset(**kwargs):
+    try:
+        supported = set(inspect.signature(Sam3DPartTrainDataset.__init__).parameters.keys())
+        supported.discard("self")
+    except Exception:
+        supported = set(kwargs.keys())
+    filtered = {k: v for k, v in kwargs.items() if k in supported}
+    dropped = sorted(set(kwargs.keys()) - set(filtered.keys()))
+    if dropped:
+        print(
+            "[dataset][compat] Sam3DPartTrainDataset does not support args; "
+            f"dropped={dropped}",
+            flush=True,
+        )
+    return Sam3DPartTrainDataset(**filtered)
+
+
+def _make_prebuild_dataset(
+    args,
+    root,
+    split_name: str,
+    rebuild_records_index: bool = False,
+    log_prefix: str = "prebuild",
+):
+    if _is_main_process():
+        print(
+            f"[{log_prefix}] initializing dataset split={split_name} root={root} "
+            f"recon_model={args.recon_model}",
+            flush=True,
+        )
+    ds = _make_sam3d_part_dataset(
         dataset_root=root,
         cache_root=args.recon_cache_root,
         cache_split=split_name,
@@ -982,6 +1097,7 @@ def _make_prebuild_dataset(args, root, split_name: str):
         instantmesh_root=args.instantmesh_root,
         instantmesh_config_path=args.instantmesh_config_path,
         instantmesh_diffusion_model=args.instantmesh_diffusion_model,
+        instantmesh_dino_model=args.instantmesh_dino_model, 
         instantmesh_unet_path=args.instantmesh_unet_path,
         instantmesh_model_path=args.instantmesh_model_path,
         instantmesh_diffusion_steps=args.instantmesh_diffusion_steps,
@@ -989,7 +1105,49 @@ def _make_prebuild_dataset(args, root, split_name: str):
         instantmesh_view=args.instantmesh_view,
         instantmesh_foreground_ratio=args.instantmesh_foreground_ratio,
         instantmesh_export_texmap=args.instantmesh_export_texmap,
+        rebuild_records_index=rebuild_records_index,
     )
+    if _is_main_process():
+        print(
+            f"[{log_prefix}] dataset ready split={split_name} "
+            f"records={len(ds.records)} parts={len(ds.part_keys)} "
+            f"recon_model={args.recon_model}",
+            flush=True,
+        )
+    return ds
+
+
+def _run_dataset_index_only(args):
+    train_root, val_root = _resolve_train_val_roots(args.dataset_root, args.train_subdir, args.val_subdir)
+    split = str(args.dataset_index_split).lower()
+    print(
+        "[dataset-index] CPU-only index build requested; "
+        "this does not initialize DDP/CUDA or load reconstruction models.",
+        flush=True,
+    )
+    print(
+        f"[dataset-index] cache_root={args.recon_cache_root} split={split} "
+        f"force_rebuild={args.force_rebuild_dataset_index}",
+        flush=True,
+    )
+    if split in ("both", "train"):
+        _make_prebuild_dataset(
+            args,
+            train_root,
+            "train",
+            rebuild_records_index=args.force_rebuild_dataset_index,
+            log_prefix="dataset-index",
+        )
+    if split in ("both", "val"):
+        _make_prebuild_dataset(
+            args,
+            val_root,
+            "val",
+            rebuild_records_index=args.force_rebuild_dataset_index,
+            log_prefix="dataset-index",
+        )
+    print(f"[dataset-index] ready for split={split}.", flush=True)
+    return "dataset_index_ready"
 
 
 def _prebuild_part_worker(worker_idx, args, root, split_name, part_keys, local_rank):
@@ -1025,6 +1183,10 @@ def _run_prebuild_phase(args, train_root, val_root, rank, world_size, local_rank
         args.recon_num_workers_per_rank,
         args.recon_num_workers,
         world_size,
+    )
+    recon_workers_per_rank = _cap_gpu_recon_workers_per_rank(
+        recon_workers_per_rank,
+        args.recon_model,
     )
     local_recon_workers = max(1, int(recon_workers_per_rank[rank]))
 
@@ -1073,6 +1235,9 @@ def _run_prebuild_phase(args, train_root, val_root, rank, world_size, local_rank
 
 
 def train_ddp(args):
+    if getattr(args, "build_dataset_index_only", False):
+        return _run_dataset_index_only(args)
+
     args.vm_weight = _safe_vm_weight(getattr(args, "vm_weight", 0.75))
     vm_weight_tag = _format_vm_weight_tag(args.vm_weight)
     if not getattr(args, "disable_vm_weight_naming", False):
@@ -1100,6 +1265,8 @@ def train_ddp(args):
         cfg["rot_rep"] = "axis_angle"
     if "trans_rep" not in cfg:
         cfg["trans_rep"] = "tracknet"
+    if "enable_ref_coord" not in cfg:
+        cfg["enable_ref_coord"] = bool(getattr(args, "enable_ref_coord", False))
 
     per_rank_bs = _parse_per_rank_value(args.batch_size_per_rank, args.batch_size, world_size)
     per_rank_workers = _parse_per_rank_value(args.num_workers_per_rank, args.num_workers, world_size)
@@ -1108,7 +1275,24 @@ def train_ddp(args):
 
     if _is_main_process():
         print(f"[dist] rank={rank} world_size={world_size} local_rank={local_rank}")
-        print(f"[load] sam3d config: {args.sam3d_config_path}")
+        print(f"[recon] model={args.recon_model}")
+        if args.recon_model in ("sam3d", "sam3d_tsdf", "sam3d_tsdf_dmesh", "all"):
+            print(f"[load] sam3d config: {args.sam3d_config_path}")
+        if args.recon_model in ("hunyuan3d", "hunyuan3d_tsdf", "hunyuan3d_tsdf_dmesh", "all"):
+            print(
+                f"[load] hunyuan model path: {args.hunyuan_model_path} "
+                f"subfolder={args.hunyuan_subfolder} "
+                f"steps={args.hunyuan_num_inference_steps} "
+                f"octree={args.hunyuan_octree_resolution} "
+                f"guidance={args.hunyuan_guidance_scale}"
+            )
+        if args.recon_model in ("instantmesh", "instantmesh_tsdf", "instantmesh_tsdf_dmesh", "all"):
+            print(f"[load] instantmesh root: {args.instantmesh_root}")
+            print(f"[load] instantmesh config: {args.instantmesh_config_path}")
+            print(f"[load] instantmesh diffusion model: {args.instantmesh_diffusion_model}")
+            print(f"[load] instantmesh dino model: {args.instantmesh_dino_model}")
+            print(f"[load] instantmesh unet: {args.instantmesh_unet_path}")
+            print(f"[load] instantmesh model: {args.instantmesh_model_path}")
         print(f"[load] train root: {train_root}")
         print(f"[load] val root: {val_root}")
         print(f"[load] config: {cfg_path}")
@@ -1161,7 +1345,7 @@ def train_ddp(args):
         for g in lr_groups:
             print(f"  - {g['name']}: lr={g['lr']} params={len(g['params'])}")
 
-    ds_train = Sam3DPartTrainDataset(
+    ds_train = _make_sam3d_part_dataset(
         dataset_root=train_root,
         cache_root=args.recon_cache_root,
         cache_split=args.train_subdir,
@@ -1191,6 +1375,7 @@ def train_ddp(args):
         instantmesh_root=args.instantmesh_root,
         instantmesh_config_path=args.instantmesh_config_path,
         instantmesh_diffusion_model=args.instantmesh_diffusion_model,
+        instantmesh_dino_model=args.instantmesh_dino_model,
         instantmesh_unet_path=args.instantmesh_unet_path,
         instantmesh_model_path=args.instantmesh_model_path,
         instantmesh_diffusion_steps=args.instantmesh_diffusion_steps,
@@ -1198,8 +1383,9 @@ def train_ddp(args):
         instantmesh_view=args.instantmesh_view,
         instantmesh_foreground_ratio=args.instantmesh_foreground_ratio,
         instantmesh_export_texmap=args.instantmesh_export_texmap,
+        defer_sample_io=True,
     )
-    ds_val = Sam3DPartTrainDataset(
+    ds_val = _make_sam3d_part_dataset(
         dataset_root=val_root,
         cache_root=args.recon_cache_root,
         cache_split=args.val_subdir,
@@ -1229,6 +1415,7 @@ def train_ddp(args):
         instantmesh_root=args.instantmesh_root,
         instantmesh_config_path=args.instantmesh_config_path,
         instantmesh_diffusion_model=args.instantmesh_diffusion_model,
+        instantmesh_dino_model=args.instantmesh_dino_model,
         instantmesh_unet_path=args.instantmesh_unet_path,
         instantmesh_model_path=args.instantmesh_model_path,
         instantmesh_diffusion_steps=args.instantmesh_diffusion_steps,
@@ -1236,6 +1423,7 @@ def train_ddp(args):
         instantmesh_view=args.instantmesh_view,
         instantmesh_foreground_ratio=args.instantmesh_foreground_ratio,
         instantmesh_export_texmap=args.instantmesh_export_texmap,
+        defer_sample_io=True,
     )
 
     train_sampler = DistributedAlignedBatchSampler(
@@ -1267,7 +1455,7 @@ def train_ddp(args):
         batch_sampler=val_sampler,
         num_workers=int(local_workers),
         pin_memory=args.pin_memory,
-        persistent_workers=(int(local_workers) > 0 and args.persistent_workers),
+        persistent_workers=False,
         collate_fn=collate_list,
     )
     if _is_main_process():
@@ -1350,6 +1538,9 @@ def train_ddp(args):
                 "epoch": int(epoch + 1),
                 "vm_weight": float(args.vm_weight),
             }
+            if getattr(ddp_model.module, "enable_ref_coord", False):
+                payload["coord_head"] = ddp_model.module.coord_head.state_dict()
+                payload["coord_conf_head"] = ddp_model.module.coord_conf_head.state_dict()
             ckpt_path = os.path.join(args.out_dir, f"train_epoch_{epoch+1:03d}_{vm_weight_tag}.pth")
             latest_path = os.path.join(args.out_dir, f"train_latest_{vm_weight_tag}.pth")
             torch.save(payload, ckpt_path)
@@ -1449,6 +1640,24 @@ def _build_parser():
     parser.add_argument("--recon-num-workers", type=int, default=0)
     parser.add_argument("--recon-num-workers-per-rank", type=str, default="")
     parser.add_argument("--recon-persistent-workers", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--build-dataset-index-only",
+        action="store_true",
+        help="Build/load the Sam3DPartTrainDataset records index on CPU and exit before DDP/CUDA setup.",
+    )
+    parser.add_argument(
+        "--dataset-index-split",
+        type=str,
+        choices=["both", "train", "val"],
+        default="both",
+        help="Which split to index when --build-dataset-index-only is set.",
+    )
+    parser.add_argument(
+        "--force-rebuild-dataset-index",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Rescan masks and rewrite the dataset records index instead of loading an existing index.",
+    )
     parser.add_argument("--prebuild-recon", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--prebuild-only",
@@ -1460,8 +1669,22 @@ def _build_parser():
         "--recon-model",
         type=str,
         default="sam3d",
-        choices=["sam3d", "hunyuan3d", "instantmesh", "all"],
-        help="Which reconstruction model cache to use/build. Use 'all' to mix SAM3D, Hunyuan3D, and InstantMesh.",
+        choices=[
+            "sam3d",
+            "sam3d_tsdf",
+            "sam3d_tsdf_dmesh",
+            "hunyuan3d",
+            "hunyuan3d_tsdf",
+            "hunyuan3d_tsdf_dmesh",
+            "instantmesh",
+            "instantmesh_tsdf",
+            "instantmesh_tsdf_dmesh",
+            "all",
+        ],
+        help=(
+            "Which reconstruction model cache to use/build. Use 'all' to mix "
+            "base, TSDF, and TSDF+DLMesh caches for SAM3D, Hunyuan3D, and InstantMesh."
+        ),
     )
     parser.add_argument(
         "--recon-view-density-scale",
@@ -1499,6 +1722,7 @@ def _build_parser():
     parser.add_argument("--instantmesh-root", type=str, default=DEFAULT_INSTANTMESH_ROOT)
     parser.add_argument("--instantmesh-config-path", type=str, default=DEFAULT_INSTANTMESH_CONFIG_PATH)
     parser.add_argument("--instantmesh-diffusion-model", type=str, default="sudo-ai/zero123plus-v1.2")
+    parser.add_argument("--instantmesh-dino-model", type=str, default="")
     parser.add_argument("--instantmesh-unet-path", type=str, default="")
     parser.add_argument("--instantmesh-model-path", type=str, default="")
     parser.add_argument("--instantmesh-diffusion-steps", type=int, default=75)
@@ -1548,6 +1772,12 @@ def _build_parser():
     )
     parser.add_argument("--aux-bce-weight", type=float, default=0.02, help="Very low weight auxiliary BCE supervision.")
     parser.add_argument("--pose-utility-scale", type=float, default=10.0)
+    parser.add_argument(
+        "--enable-ref-coord",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable optional reference-coordinate auxiliary heads. Default off keeps current training I/O unchanged.",
+    )
     parser.add_argument(
         "--disable-vm-weight-naming",
         action=argparse.BooleanOptionalAction,

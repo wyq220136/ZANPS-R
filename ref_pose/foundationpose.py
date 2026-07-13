@@ -212,7 +212,46 @@ class FoundationPose:
 
 
   @torch.inference_mode()
-  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=8, use_nvdiffrast=True, init_pose=None):
+  def sample_local_pose_candidates(self, K, rgb, depth, ob_mask, init_pose=None, max_candidates=8):
+    """Generate object-frame pose candidates around an input pose without refinement."""
+    if ob_mask.ndim == 3:
+      ob_mask = ob_mask[..., 0]
+    init_pose_centered = None
+    if init_pose is not None:
+      try:
+        init_pose = np.asarray(init_pose, dtype=np.float32).reshape(4, 4)
+        tf_to_center = self.get_tf_to_centered_mesh().data.cpu().numpy()
+        init_pose_centered = init_pose @ np.linalg.inv(tf_to_center)
+      except Exception as e:
+        logging.warning(f"Invalid init_pose for local candidate sampling, fallback to global sampling: {e}")
+        init_pose_centered = None
+
+    poses = self.generate_random_pose_hypo(
+      K=K,
+      rgb=rgb,
+      depth=depth,
+      mask=ob_mask,
+      scene_pts=None,
+      init_pose=init_pose_centered,
+    )
+    if init_pose_centered is None:
+      center = self.guess_translation(depth=depth, mask=ob_mask, K=K)
+      poses[:, :3, 3] = torch.as_tensor(center.reshape(1, 3), device='cuda', dtype=torch.float)
+
+    poses = poses @ self.get_tf_to_centered_mesh()
+    poses_np = poses.data.cpu().numpy().reshape(-1, 4, 4)
+    if max_candidates is not None and int(max_candidates) > 0 and len(poses_np) > int(max_candidates):
+      # Keep the coarse init and spread the rest across the local rotation grid.
+      keep = [0]
+      if int(max_candidates) > 1:
+        rest = np.linspace(1, len(poses_np) - 1, int(max_candidates) - 1).astype(np.int64).tolist()
+        keep.extend(rest)
+      poses_np = poses_np[keep]
+    return poses_np.astype(np.float32)
+
+
+  @torch.inference_mode()
+  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=8, use_nvdiffrast=True, init_pose=None, return_candidates=False):
     '''Copmute pose from given pts to self.pcd
     @pts: (N,3) np array, downsampled scene points
     '''
@@ -237,6 +276,8 @@ class FoundationPose:
       logging.info(f'valid too small, return')
       pose = np.eye(4)
       pose[:3,3] = self.guess_translation(depth=depth, mask=ob_mask, K=K)
+      if return_candidates:
+        return pose, [{"pose": pose, "score": 0.0, "rank": 0}]
       return pose
 
     init_pose_centered = None
@@ -268,6 +309,12 @@ class FoundationPose:
     if not use_nvdiffrast:
       # NvDiff-disabled fallback: skip render-based refine/score and keep a deterministic coarse pose.
       best_pose = poses[0] @ self.get_tf_to_centered_mesh()
+      if return_candidates:
+        return best_pose.data.cpu().numpy(), [{
+          "pose": best_pose.data.cpu().numpy(),
+          "score": 0.0,
+          "rank": 0,
+        }]
       return best_pose.data.cpu().numpy()
 
     add_errs = self.compute_add_err_to_gt_pose(poses)
@@ -296,7 +343,18 @@ class FoundationPose:
 
     logging.info(f'sorted scores:{scores}')
 
-    best_pose = poses[0]@self.get_tf_to_centered_mesh()
+    centered_tf = self.get_tf_to_centered_mesh()
+    best_pose = poses[0]@centered_tf
+
+    if return_candidates:
+      cand = []
+      for rank in range(len(poses)):
+        cand.append({
+          "pose": (poses[rank] @ centered_tf).data.cpu().numpy(),
+          "score": float(scores[rank].data.cpu().item()) if torch.is_tensor(scores[rank]) else float(scores[rank]),
+          "rank": int(rank),
+        })
+      return best_pose.data.cpu().numpy(), cand
 
     return best_pose.data.cpu().numpy()
 

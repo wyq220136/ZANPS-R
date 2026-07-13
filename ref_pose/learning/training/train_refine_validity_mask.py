@@ -82,10 +82,21 @@ def _resolve_sam3d_config_path(config_arg: str | None, sam3d_project_root: str):
         return os.path.normpath(config_arg)
 
     project_root = os.path.normpath(sam3d_project_root)
+    preferred = os.path.join(project_root, "checkpoints", "hf", "pipeline.yaml")
+    if os.path.exists(preferred):
+        return os.path.normpath(preferred)
+
     pattern = os.path.join(project_root, "checkpoints", "*", "pipeline.yaml")
     candidates = sorted(glob.glob(pattern))
     if candidates:
-        return os.path.normpath(candidates[-1])
+        if len(candidates) > 1:
+            print(
+                "[warn] multiple SAM3D pipeline configs found; using the first sorted candidate. "
+                "Pass --sam3d-config-path explicitly if this is not the checkpoint you want. "
+                f"candidates={candidates}",
+                flush=True,
+            )
+        return os.path.normpath(candidates[0])
 
     raise FileNotFoundError(
         "SAM3D pipeline config not found. "

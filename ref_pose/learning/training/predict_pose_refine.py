@@ -155,6 +155,7 @@ class PoseRefinePredictor:
     self.last_trans_update = None
     self.last_rot_update = None
     self.last_validity_mask = None
+    self.last_refine_trace = None
 
 
   @torch.inference_mode()
@@ -190,10 +191,19 @@ class PoseRefinePredictor:
     if not isinstance(trans_normalizer, float):
       trans_normalizer = torch.as_tensor(list(trans_normalizer), device='cuda', dtype=torch.float).reshape(1,3)
 
-    for _ in range(iteration):
+    trace = {
+      "iterations": [],
+      "num_hypotheses": int(len(ob_in_cams)),
+    }
+
+    for iter_idx in range(iteration):
       logging.info("making cropped data")
       pose_data = make_crop_data_batch(self.cfg.input_resize, B_in_cams, mesh_centered, rgb_tensor, depth_tensor, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter)
       B_in_cams = []
+      iter_validity = []
+      iter_geom = []
+      iter_utility = []
+      iter_trans = []
       for b in range(0, pose_data.rgbAs.shape[0], bs):
         A = torch.cat([pose_data.rgbAs[b:b+bs].cuda(), pose_data.xyz_mapAs[b:b+bs].cuda()], dim=1).float()
         B = torch.cat([pose_data.rgbBs[b:b+bs].cuda(), pose_data.xyz_mapBs[b:b+bs].cuda()], dim=1).float()
@@ -249,18 +259,35 @@ class PoseRefinePredictor:
 
         B_in_cam = egocentric_delta_pose_to_pose(pose_data.poseA[b:b+bs], trans_delta=trans_delta, rot_mat_delta=rot_mat_delta)
         B_in_cams.append(B_in_cam)
+        iter_trans.append(float(torch.linalg.norm(trans_delta.detach()).item()))
         if 'validity_mask' in output:
           if prev_validity_mask is None:
             prev_validity_mask = torch.zeros((pose_data.rgbAs.shape[0], 1, A.shape[-2], A.shape[-1]), device='cuda', dtype=torch.float)
           prev_validity_mask[b:b+bs] = output['validity_mask'].detach()
+          iter_validity.append(float(output['validity_mask'].detach().mean().item()))
+        if 'geom_validity' in output:
+          iter_geom.append(float(output['geom_validity'].detach().mean().item()))
+        if 'pose_utility' in output:
+          iter_utility.append(float(output['pose_utility'].detach().mean().item()))
 
       B_in_cams = torch.cat(B_in_cams, dim=0).reshape(len(ob_in_cams),4,4)
+      trace["iterations"].append({
+        "iteration": int(iter_idx),
+        "validity_mean": float(np.mean(iter_validity)) if iter_validity else None,
+        "geom_validity_mean": float(np.mean(iter_geom)) if iter_geom else None,
+        "pose_utility_mean": float(np.mean(iter_utility)) if iter_utility else None,
+        "trans_update_norm_mean": float(np.mean(iter_trans)) if iter_trans else None,
+      })
 
     B_in_cams_out = B_in_cams@torch.tensor(tf_to_center[None], device='cuda', dtype=torch.float)
     torch.cuda.empty_cache()
     self.last_trans_update = trans_delta
     self.last_rot_update = rot_mat_delta
     self.last_validity_mask = prev_validity_mask.detach().cpu() if prev_validity_mask is not None else None
+    trace["final_validity_mean"] = (
+      float(self.last_validity_mask.mean().item()) if self.last_validity_mask is not None else None
+    )
+    self.last_refine_trace = trace
 
     if get_vis:
       logging.info("get_vis...")

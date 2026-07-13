@@ -94,6 +94,10 @@ class RefineNet(nn.Module):
     )
     self.geom_head = nn.Conv2d(64, 1, kernel_size=1, stride=1, padding=0)
     self.pose_head = nn.Conv2d(64, 1, kernel_size=1, stride=1, padding=0)
+    self.enable_ref_coord = bool(self.cfg.get('enable_ref_coord', False))
+    if self.enable_ref_coord:
+      self.coord_head = nn.Conv2d(64, 3, kernel_size=1, stride=1, padding=0)
+      self.coord_conf_head = nn.Conv2d(64, 1, kernel_size=1, stride=1, padding=0)
 
 
   def forward(self, A, B):
@@ -138,5 +142,13 @@ class RefineNet(nn.Module):
     output['pose_utility'] = pose_utility
     # Backward-compatible key used by existing callers.
     output['validity_mask'] = geom_validity * pose_utility
+    if self.enable_ref_coord:
+      ref_coord = self.coord_head(mask_feat)
+      coord_conf_logits = self.coord_conf_head(mask_feat)
+      ref_coord = F.interpolate(ref_coord, size=A.shape[-2:], mode='bilinear', align_corners=False)
+      coord_conf_logits = F.interpolate(coord_conf_logits, size=A.shape[-2:], mode='bilinear', align_corners=False)
+      output['ref_coord'] = ref_coord
+      output['coord_conf_logits'] = coord_conf_logits
+      output['coord_conf'] = torch.sigmoid(coord_conf_logits)
 
     return output

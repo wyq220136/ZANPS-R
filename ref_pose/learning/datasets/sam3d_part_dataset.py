@@ -1,8 +1,10 @@
+import argparse
 import os
 import sys
 import json
 import hashlib
 import pickle
+import re
 import time
 from pathlib import Path
 from dataclasses import dataclass
@@ -78,6 +80,7 @@ class Sam3DPartTrainDataset(Dataset):
         instantmesh_root: str | None = None,
         instantmesh_config_path: str | None = None,
         instantmesh_diffusion_model: str = "sudo-ai/zero123plus-v1.2",
+        instantmesh_dino_model: str = "",
         instantmesh_unet_path: str = "",
         instantmesh_model_path: str = "",
         instantmesh_diffusion_steps: int = 75,
@@ -85,6 +88,8 @@ class Sam3DPartTrainDataset(Dataset):
         instantmesh_view: int = 6,
         instantmesh_foreground_ratio: float = 0.85,
         instantmesh_export_texmap: bool = False,
+        defer_sample_io: bool = False,
+        rebuild_records_index: bool = False,
     ):
         self.dataset_root = os.path.abspath(dataset_root)
         self.cache_root = os.path.abspath(cache_root)
@@ -115,6 +120,7 @@ class Sam3DPartTrainDataset(Dataset):
         self.instantmesh_root = instantmesh_root
         self.instantmesh_config_path = instantmesh_config_path
         self.instantmesh_diffusion_model = str(instantmesh_diffusion_model)
+        self.instantmesh_dino_model = str(instantmesh_dino_model or "")
         self.instantmesh_unet_path = str(instantmesh_unet_path or "")
         self.instantmesh_model_path = str(instantmesh_model_path or "")
         self.instantmesh_diffusion_steps = int(instantmesh_diffusion_steps)
@@ -122,7 +128,19 @@ class Sam3DPartTrainDataset(Dataset):
         self.instantmesh_view = int(instantmesh_view)
         self.instantmesh_foreground_ratio = float(instantmesh_foreground_ratio)
         self.instantmesh_export_texmap = bool(instantmesh_export_texmap)
-        self._supported_recon_models = ("sam3d", "hunyuan3d", "instantmesh")
+        self.defer_sample_io = bool(defer_sample_io)
+        self.rebuild_records_index = bool(rebuild_records_index)
+        self._supported_recon_models = (
+            "sam3d",
+            "sam3d_tsdf",
+            "sam3d_tsdf_dmesh",
+            "hunyuan3d",
+            "hunyuan3d_tsdf",
+            "hunyuan3d_tsdf_dmesh",
+            "instantmesh",
+            "instantmesh_tsdf",
+            "instantmesh_tsdf_dmesh",
+        )
         if self.recon_model not in (*self._supported_recon_models, "all"):
             raise ValueError(
                 f"unsupported recon_model={self.recon_model}, "
@@ -138,11 +156,15 @@ class Sam3DPartTrainDataset(Dataset):
         self._getitem_calls = 0
         self._recon_failures = 0
         self._bad_recon_records: set[tuple[str, str, str]] = set()
+        self._object_recon_builds: set[tuple[str, str]] = set()
         self._bad_recon_skips = 0
         self._invisible_record_skips = 0
         self._fallback_uses = 0
         os.makedirs(self.cache_root, exist_ok=True)
-        if not self._load_records_index():
+        if self.rebuild_records_index:
+            self._collect_records()
+            self._write_records_index()
+        elif not self._load_records_index():
             self._collect_records()
             self._write_records_index()
         if not self.allow_recon_write:
@@ -156,13 +178,36 @@ class Sam3DPartTrainDataset(Dataset):
             f"recon_views={self.recon_min_views_per_part}-{self.recon_max_views_per_part} "
             f"pose_thresholds(rot_deg={self.recon_rot_threshold_deg}, trans={self.recon_trans_threshold}) "
             f"use_real_depth_pointmap={self.use_real_depth_pointmap} "
-            f"recon_model={self.recon_model} recon_view_density_scale={self.recon_view_density_scale:.2f}"
+            f"recon_model={self.recon_model} recon_view_density_scale={self.recon_view_density_scale:.2f} "
+            f"defer_sample_io={self.defer_sample_io} "
+            f"rebuild_records_index={self.rebuild_records_index}"
         )
 
     def _active_recon_models(self):
         if self.recon_model == "all":
             return list(self._supported_recon_models)
         return [self.recon_model]
+
+    @staticmethod
+    def _is_object_level_recon_model(recon_model: str):
+        return str(recon_model).lower().strip().endswith(("_tsdf", "_tsdf_dmesh"))
+
+    @staticmethod
+    def _base_recon_model(recon_model: str):
+        model = str(recon_model).lower().strip()
+        if model.startswith("sam3d"):
+            return "sam3d"
+        if model.startswith("hunyuan3d"):
+            return "hunyuan3d"
+        if model.startswith("instantmesh"):
+            return "instantmesh"
+        return model
+
+    @staticmethod
+    def _part_model_name(part_name: str, fallback_idx: int = 0):
+        match = re.search(r"(\d+)", str(part_name))
+        idx = int(match.group(1)) if match else int(fallback_idx)
+        return f"model_{idx:04d}"
 
     def _records_index_enabled(self):
         return os.environ.get("SAM3D_PART_DATASET_DISABLE_INDEX", "").strip().lower() not in ("1", "true", "yes")
@@ -343,7 +388,8 @@ class Sam3DPartTrainDataset(Dataset):
     def _ensure_reconstruction_imports(self):
         repo_root = Path(__file__).resolve().parents[3]
         recon_root = repo_root / "reconstruction"
-        for p in (str(repo_root), str(recon_root)):
+        tools_root = recon_root / "tools"
+        for p in (str(repo_root), str(recon_root), str(tools_root)):
             if p not in sys.path:
                 sys.path.insert(0, p)
 
@@ -405,6 +451,7 @@ class Sam3DPartTrainDataset(Dataset):
                 "[dataset] loading InstantMesh reconstructor "
                 f"root={instantmesh_root} config={config_path} "
                 f"steps={self.instantmesh_diffusion_steps} "
+                f"dino_model={self.instantmesh_dino_model} "
                 f"view={self.instantmesh_view}",
                 flush=True,
             )
@@ -412,6 +459,7 @@ class Sam3DPartTrainDataset(Dataset):
                 instantmesh_root=str(instantmesh_root),
                 config_path=str(config_path),
                 diffusion_model=self.instantmesh_diffusion_model,
+                dino_model=self.instantmesh_dino_model,
                 unet_path=self.instantmesh_unet_path,
                 model_path=self.instantmesh_model_path,
                 diffusion_steps=self.instantmesh_diffusion_steps,
@@ -425,10 +473,18 @@ class Sam3DPartTrainDataset(Dataset):
         return self._instantmesh_reconstructor
 
     def _collect_records(self):
+        t0 = time.time()
         obj_names = sorted(
             [d for d in os.listdir(self.dataset_root) if os.path.isdir(os.path.join(self.dataset_root, d))]
         )
-        for obj_name in obj_names:
+        print(
+            f"[dataset-index] collecting records root={self.dataset_root} "
+            f"objects={len(obj_names)} min_mask_pixels={self.min_mask_pixels}",
+            flush=True,
+        )
+        scanned_masks = 0
+        kept_records = 0
+        for obj_idx, obj_name in enumerate(obj_names, start=1):
             obj_dir = os.path.join(self.dataset_root, obj_name)
             rgb_dir = os.path.join(obj_dir, "rgb")
             masks_dir = os.path.join(obj_dir, "masks")
@@ -441,6 +497,14 @@ class Sam3DPartTrainDataset(Dataset):
                 continue
 
             part_dirs = sorted([d for d in os.listdir(models_dir) if os.path.isdir(os.path.join(models_dir, d))])
+            if obj_idx == 1 or obj_idx % 10 == 0 or obj_idx == len(obj_names):
+                print(
+                    f"[dataset-index] scanning object {obj_idx}/{len(obj_names)} "
+                    f"name={obj_name} parts={len(part_dirs)} "
+                    f"scanned_masks={scanned_masks} kept_records={kept_records} "
+                    f"elapsed={time.time() - t0:.1f}s",
+                    flush=True,
+                )
             for part_name in part_dirs:
                 part_mask_dir = os.path.join(masks_dir, part_name)
                 gt_mesh_path = os.path.join(models_dir, part_name, "model.obj")
@@ -448,6 +512,14 @@ class Sam3DPartTrainDataset(Dataset):
                     continue
                 mask_files = sorted([f for f in os.listdir(part_mask_dir) if f.lower().endswith(".png")])
                 for mf in mask_files:
+                    scanned_masks += 1
+                    if scanned_masks % 5000 == 0:
+                        print(
+                            f"[dataset-index] scanned_masks={scanned_masks} "
+                            f"kept_records={kept_records} current={obj_name}/{part_name}/{mf} "
+                            f"elapsed={time.time() - t0:.1f}s",
+                            flush=True,
+                        )
                     frame_id = os.path.splitext(mf)[0]
                     mask_path = os.path.join(part_mask_dir, mf)
                     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
@@ -498,7 +570,13 @@ class Sam3DPartTrainDataset(Dataset):
                     index = len(self.records)
                     self.records.append(rec)
                     self.part_to_indices.setdefault((obj_name, part_name), []).append(index)
+                    kept_records += 1
         self.part_keys = sorted(self.part_to_indices.keys())
+        print(
+            f"[dataset-index] collected records={len(self.records)} parts={len(self.part_keys)} "
+            f"scanned_masks={scanned_masks} seconds={time.time() - t0:.2f}",
+            flush=True,
+        )
 
     def _visible_sample_ok(self, mask_bin: np.ndarray):
         mask_bool = np.asarray(mask_bin) > 0
@@ -615,6 +693,21 @@ class Sam3DPartTrainDataset(Dataset):
         return os.path.join(self.get_part_cache_dir(obj_name, part_name, recon_model), "manifest.json")
 
     def get_recon_path_for_record(self, rec: PartRecord, recon_model: str):
+        recon_model = str(recon_model).lower().strip()
+        if self._is_object_level_recon_model(recon_model):
+            split_parts = [self.cache_root, recon_model]
+            if self.cache_split:
+                split_parts.append(self.cache_split)
+            split_parts.extend(
+                [
+                    rec.obj_name,
+                    "pose_ready_models",
+                    "view_0",
+                    self._part_model_name(rec.part_name),
+                    "model.obj",
+                ]
+            )
+            return os.path.join(*split_parts)
         return os.path.join(
             self.get_part_cache_dir(rec.obj_name, rec.part_name, recon_model),
             rec.frame_id,
@@ -710,11 +803,250 @@ class Sam3DPartTrainDataset(Dataset):
         except Exception:
             return False
 
+    def _write_object_recon_meta_if_needed(self, recon_mesh_path: str, recon_model: str, backend: str):
+        if not recon_mesh_path or not os.path.exists(recon_mesh_path):
+            return False
+        meta_path = os.path.join(os.path.dirname(recon_mesh_path), "recon_meta.json")
+        if os.path.exists(meta_path):
+            return self._recon_output_is_complete(recon_mesh_path)
+        data = {
+            "gt_pose_aligned": True,
+            "recon_model": str(recon_model),
+            "backend": str(backend),
+            "source": "reconstruction_object_level_pipeline",
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+
+    def _object_recon_runner(self, recon_model: str):
+        self._ensure_reconstruction_imports()
+        model = str(recon_model).lower().strip()
+        if model == "sam3d_tsdf":
+            from run.recon_sam3d_tsdf import reconstruct_object
+        elif model == "sam3d_tsdf_dmesh":
+            from run.recon_sam3d_tsdf_dmesh import reconstruct_object
+        elif model == "hunyuan3d_tsdf":
+            from run.recon_hunyuan3d_tsdf import reconstruct_object
+        elif model == "hunyuan3d_tsdf_dmesh":
+            from run.recon_hunyuan3d_tsdf_dmesh import reconstruct_object
+        elif model == "instantmesh_tsdf":
+            from run.recon_instantmesh_tsdf import reconstruct_object
+        elif model == "instantmesh_tsdf_dmesh":
+            from run.recon_instantmesh_tsdf_dmesh import reconstruct_object
+        else:
+            raise ValueError(f"not an object-level reconstruction model: {recon_model}")
+        return reconstruct_object
+
+    def _make_object_recon_args(self, recon_model: str, obj_name: str):
+        self._ensure_reconstruction_imports()
+        from recon_utils import add_common_args  # noqa
+        from recon_tsdf_common import add_tsdf_args  # noqa
+
+        parser = argparse.ArgumentParser(add_help=False, conflict_handler="resolve")
+        add_common_args(parser, str(recon_model))
+        add_tsdf_args(parser)
+        if str(recon_model).lower().strip().endswith("_tsdf_dmesh"):
+            from recon_dmesh_common import add_dmesh_args  # noqa
+
+            add_dmesh_args(parser)
+        if self._base_recon_model(recon_model) == "instantmesh":
+            from run.recon_instantmesh import add_instantmesh_args  # noqa
+
+            add_instantmesh_args(parser)
+        args = parser.parse_args([])
+
+        split_name = self.cache_split or Path(self.dataset_root).name
+        data_root = str(Path(self.dataset_root).resolve().parent)
+        args.data_root = data_root
+        args.split = split_name
+        args.work_root = self.cache_root
+        args.objects = str(obj_name)
+        args.object_source = "all"
+        args.start = 0
+        args.end = None
+        args.mode = "single"
+        args.num_workers = 1
+        args.gpus = ""
+        args.workers_per_gpu = ""
+        args.coord_dir = ""
+        args.reset_coord = False
+        args.stale_lock_sec = 12 * 3600
+        args.poll_interval_sec = 3.0
+        args.overwrite = bool(self.rebuild_recon)
+        args.build_base_if_missing = True
+        args.min_mask_pixels = int(self.min_mask_pixels)
+        args.depth_scale = float(self.depth_scale)
+        args.pose_convention = "sapien"
+
+        args.model_path = str(self.hunyuan_model_path or "")
+        args.subfolder = str(self.hunyuan_subfolder)
+        args.num_inference_steps = int(self.hunyuan_num_inference_steps)
+        args.octree_resolution = int(self.hunyuan_octree_resolution)
+        args.guidance_scale = float(self.hunyuan_guidance_scale)
+        args.alignment_samples = getattr(args, "alignment_samples", 50000)
+        args.alignment_seed = getattr(args, "alignment_seed", 2026)
+        args.min_alignment_points = getattr(args, "min_alignment_points", 200)
+        args.alignment_icp_iters = getattr(args, "alignment_icp_iters", 30)
+        args.alignment_trim_quantile = getattr(args, "alignment_trim_quantile", 0.8)
+
+        if self._base_recon_model(recon_model) == "instantmesh":
+            args.instantmesh_root = str(self.instantmesh_root or "")
+            args.instantmesh_config_path = str(self.instantmesh_config_path or "")
+            args.instantmesh_diffusion_model = str(self.instantmesh_diffusion_model)
+            args.instantmesh_dino_model = str(self.instantmesh_dino_model)
+            args.instantmesh_unet_path = str(self.instantmesh_unet_path)
+            args.instantmesh_model_path = str(self.instantmesh_model_path)
+            args.instantmesh_diffusion_steps = int(self.instantmesh_diffusion_steps)
+            args.instantmesh_seed = int(self.seed)
+            args.instantmesh_scale = float(self.instantmesh_scale)
+            args.instantmesh_view = int(self.instantmesh_view)
+            args.instantmesh_foreground_ratio = float(self.instantmesh_foreground_ratio)
+            args.instantmesh_export_texmap = bool(self.instantmesh_export_texmap)
+        return args
+
+    def _ensure_object_level_recon_for_part(
+        self,
+        part_key: tuple[str, str],
+        rec: PartRecord,
+        recon_model: str,
+    ):
+        target = self.get_recon_path_for_record(rec, recon_model)
+        if (not self.rebuild_recon) and self._recon_output_is_complete(target):
+            return True
+
+        build_key = (rec.obj_name, str(recon_model))
+        if build_key not in self._object_recon_builds or self.rebuild_recon:
+            self._object_recon_builds.add(build_key)
+            try:
+                self._ensure_reconstruction_imports()
+                from recon_utils import DatasetObject  # noqa
+
+                args = self._make_object_recon_args(recon_model, rec.obj_name)
+                obj = DatasetObject(
+                    data_root=Path(args.data_root).resolve(),
+                    split=str(args.split),
+                    name=str(rec.obj_name),
+                )
+                print(
+                    f"[dataset][object-recon] model={recon_model} obj={rec.obj_name} "
+                    f"work_root={args.work_root} split={args.split}",
+                    flush=True,
+                )
+                self._object_recon_runner(recon_model)(obj, args)
+            except Exception as e:
+                self._recon_failures += 1
+                if self._recon_failures <= 5 or (self._recon_failures % 50 == 0):
+                    print(
+                        f"[dataset][warn] object-level recon failed ({self._recon_failures}) "
+                        f"model={recon_model} obj={rec.obj_name} part={rec.part_name} err={repr(e)}",
+                        flush=True,
+                    )
+
+        ok = os.path.exists(target)
+        if ok:
+            ok = self._write_object_recon_meta_if_needed(
+                target,
+                recon_model=recon_model,
+                backend="tsdf_dmesh" if str(recon_model).endswith("_tsdf_dmesh") else "tsdf",
+            )
+        return bool(ok and self._recon_output_is_complete(target))
+
+    def _retry_manifest_skipped_frames(
+        self,
+        part_key: tuple[str, str],
+        recon_model: str,
+        manifest: dict | None,
+    ):
+        """Retry frames that were recorded as skipped in the manifest.
+
+        This is intentionally not an overwrite/rebuild path. It trusts the
+        existing successful selected_frames, reads only skipped_frames from the
+        JSON manifest, and retries those frame ids if their PartRecord still
+        exists in the current dataset index. Successful retries are appended to
+        selected_frames and removed from skipped_frames; failed retries stay in
+        skipped_frames so another resume can try again later.
+        """
+        if not manifest or self.rebuild_recon or self.force_resample_recon:
+            return manifest
+        skipped_frames = list(manifest.get("skipped_frames", []) or [])
+        if not skipped_frames:
+            return manifest
+
+        indices_by_frame = {
+            str(self.records[idx].frame_id): idx
+            for idx in self.part_to_indices.get(part_key, [])
+        }
+        selected_frames = list(manifest.get("selected_frames", []) or [])
+        selected_frame_ids = {
+            str(item.get("frame_id"))
+            for item in selected_frames
+            if item.get("frame_id") is not None
+        }
+        kept_skipped = []
+        retried = 0
+        recovered = 0
+
+        for item in skipped_frames:
+            frame_id = str(item.get("frame_id", ""))
+            idx = indices_by_frame.get(frame_id)
+            if idx is None or frame_id in selected_frame_ids:
+                kept_skipped.append(item)
+                continue
+            rec = self.records[idx]
+            recon_obj_path = self.get_recon_path_for_record(rec, recon_model)
+            retried += 1
+            if (not self.rebuild_recon) and self._recon_output_is_complete(recon_obj_path):
+                ok = True
+            else:
+                ok = self._reconstruct_mesh_from_rgb_mask(
+                    rec.rgb_path,
+                    rec.mask_path,
+                    rec.depth_path,
+                    rec.K_path,
+                    rec.pose,
+                    recon_obj_path,
+                    recon_model=recon_model,
+                )
+            if ok:
+                recovered += 1
+                selected_frames.append(
+                    {
+                        "frame_id": rec.frame_id,
+                        "pose": rec.pose.astype(float).tolist(),
+                        "recon_mesh_path": recon_obj_path,
+                    }
+                )
+                selected_frame_ids.add(frame_id)
+            else:
+                kept_skipped.append(item)
+
+        if retried <= 0:
+            return manifest
+
+        manifest = dict(manifest)
+        manifest["selected_frames"] = selected_frames
+        manifest["skipped_frames"] = kept_skipped
+        if recovered > 0:
+            manifest["complete"] = bool(manifest.get("complete", False) or self._manifest_is_complete(manifest))
+        os.makedirs(self.get_part_cache_dir(part_key[0], part_key[1], recon_model), exist_ok=True)
+        with open(self.get_part_manifest_path(part_key[0], part_key[1], recon_model), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        self._manifest_cache[(part_key[0], part_key[1], recon_model)] = manifest
+        print(
+            f"[dataset][resume] retried skipped frames model={recon_model} "
+            f"obj={part_key[0]} part={part_key[1]} retried={retried} recovered={recovered} "
+            f"remaining_skipped={len(kept_skipped)}",
+            flush=True,
+        )
+        return manifest
+
     def ensure_recon_cache_for_part(self, part_key: tuple[str, str]):
         manifests = {}
         for recon_model in self._active_recon_models():
             manifest = None if self.force_resample_recon else self._load_manifest(part_key, recon_model)
             if (not self.rebuild_recon) and self._manifest_is_complete(manifest):
+                manifest = self._retry_manifest_skipped_frames(part_key, recon_model, manifest)
                 manifests[recon_model] = manifest
                 continue
 
@@ -730,15 +1062,46 @@ class Sam3DPartTrainDataset(Dataset):
                 continue
 
             selected_indices = self._select_recon_indices_for_part(indices)
-            selected_set = set(selected_indices)
-            remaining_indices = [idx for idx in indices if idx not in selected_set]
-            candidate_indices = selected_indices + remaining_indices
             target_min = min(
                 max(1, self.recon_min_views_per_part),
                 max(1, int(round(self.recon_max_views_per_part * self.recon_view_density_scale))),
                 len(indices),
             )
             target_max = min(max(1, int(round(self.recon_max_views_per_part * self.recon_view_density_scale))), len(indices))
+
+            if self._is_object_level_recon_model(recon_model):
+                rec0 = self.records[selected_indices[0]]
+                ok = self._ensure_object_level_recon_for_part(part_key, rec0, recon_model)
+                successful_indices = selected_indices[:target_max] if ok else []
+                skipped_frames = [] if ok else [
+                    {
+                        "reason": "object_level_reconstruction_failed",
+                        "recon_model": recon_model,
+                        "expected_model": self.get_recon_path_for_record(rec0, recon_model),
+                    }
+                ]
+                complete = len(successful_indices) >= target_min
+                manifest = self._write_manifest(
+                    part_key,
+                    recon_model,
+                    successful_indices,
+                    skipped_frames=skipped_frames,
+                    complete=complete,
+                )
+                manifests[recon_model] = manifest
+                if not complete:
+                    self._bad_recon_skips += 1
+                    if self._bad_recon_skips <= 10 or (self._bad_recon_skips % 100 == 0):
+                        print(
+                            f"[dataset][skip] incomplete object-level reconstruction cache ({self._bad_recon_skips}) "
+                            f"model={recon_model} obj={part_key[0]} part={part_key[1]} "
+                            f"success={len(successful_indices)}/{target_min}"
+                        )
+                continue
+
+            selected_set = set(selected_indices)
+            remaining_indices = [idx for idx in indices if idx not in selected_set]
+            candidate_indices = selected_indices + remaining_indices
             successful_indices = []
             skipped_frames = []
 
@@ -793,6 +1156,7 @@ class Sam3DPartTrainDataset(Dataset):
     def _select_cached_recon_for_record(self, rec: PartRecord):
         part_key = (rec.obj_name, rec.part_name)
         out = []
+        seen = set()
         for recon_model in self._active_recon_models():
             manifest = self._load_manifest(part_key, recon_model)
             if not self._manifest_is_complete(manifest):
@@ -806,11 +1170,16 @@ class Sam3DPartTrainDataset(Dataset):
 
             frames = manifest.get("selected_frames", [])
             for item in frames:
+                recon_mesh_path = item.get("recon_mesh_path")
+                dedupe_key = (recon_model, recon_mesh_path)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
                 out.append(
                     {
                         "recon_model": recon_model,
                         "recon_frame_id": item.get("frame_id"),
-                        "recon_mesh_path": item.get("recon_mesh_path"),
+                        "recon_mesh_path": recon_mesh_path,
                     }
                 )
         return out
@@ -1377,6 +1746,7 @@ class Sam3DPartTrainDataset(Dataset):
                     "instantmesh_root": str(self.instantmesh_root or ""),
                     "instantmesh_config_path": str(self.instantmesh_config_path or ""),
                     "instantmesh_diffusion_model": self.instantmesh_diffusion_model,
+                    "instantmesh_dino_model": self.instantmesh_dino_model,
                     "instantmesh_unet_path": self.instantmesh_unet_path,
                     "instantmesh_model_path": self.instantmesh_model_path,
                     "instantmesh_diffusion_steps": int(self.instantmesh_diffusion_steps),
@@ -1400,26 +1770,6 @@ class Sam3DPartTrainDataset(Dataset):
         if self._getitem_calls <= 3:
             print(f"[dataset] __getitem__ call={self._getitem_calls} index={index}")
         rec = self.records[index]
-        mask = cv2.imread(rec.mask_path, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise RuntimeError(f"failed to read mask: {rec.mask_path}")
-        if int(np.count_nonzero(mask > 0)) < self.min_mask_pixels:
-            raise RuntimeError(
-                f"mask has too few valid pixels ({int(np.count_nonzero(mask > 0))}) in {rec.mask_path}"
-            )
-
-        rgb = cv2.imread(rec.rgb_path, cv2.IMREAD_COLOR)
-        if rgb is None:
-            raise RuntimeError(f"failed to read rgb: {rec.rgb_path}")
-        rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB).astype(np.float32)
-        mask_bin = (mask > 0).astype(np.uint8)
-        depth = self._load_depth(rec.depth_path)
-        if depth.shape[:2] != mask_bin.shape[:2]:
-            raise RuntimeError(
-                f"depth/mask shape mismatch: depth={depth.shape} mask={mask_bin.shape} file={rec.depth_path}"
-            )
-        K = np.loadtxt(rec.K_path, dtype=np.float32).reshape(3, 3)
-
         try:
             recon_candidates = self._select_cached_recon_for_record(rec)
         except Exception:
@@ -1442,6 +1792,43 @@ class Sam3DPartTrainDataset(Dataset):
         init_pose = rec.pose
         if init_pose is None:
             raise RuntimeError(f"missing cam_params pose for {rec.obj_name}/{rec.part_name}/{rec.frame_id}")
+
+        if self.defer_sample_io:
+            return {
+                "obj_name": rec.obj_name,
+                "frame_id": rec.frame_id,
+                "part_name": rec.part_name,
+                "recon_candidates": recon_candidates,
+                "rgb_path": rec.rgb_path,
+                "mask_path": rec.mask_path,
+                "depth_path": rec.depth_path,
+                "K_path": rec.K_path,
+                "depth_scale": self.depth_scale,
+                "min_mask_pixels": self.min_mask_pixels,
+                "recon_mesh_paths": [c["recon_mesh_path"] for c in recon_candidates if c.get("recon_mesh_path")],
+                "gt_mesh_path": rec.gt_mesh_path,
+                "init_pose": init_pose,
+            }
+
+        mask = cv2.imread(rec.mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise RuntimeError(f"failed to read mask: {rec.mask_path}")
+        if int(np.count_nonzero(mask > 0)) < self.min_mask_pixels:
+            raise RuntimeError(
+                f"mask has too few valid pixels ({int(np.count_nonzero(mask > 0))}) in {rec.mask_path}"
+            )
+
+        rgb = cv2.imread(rec.rgb_path, cv2.IMREAD_COLOR)
+        if rgb is None:
+            raise RuntimeError(f"failed to read rgb: {rec.rgb_path}")
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB).astype(np.float32)
+        mask_bin = (mask > 0).astype(np.uint8)
+        depth = self._load_depth(rec.depth_path)
+        if depth.shape[:2] != mask_bin.shape[:2]:
+            raise RuntimeError(
+                f"depth/mask shape mismatch: depth={depth.shape} mask={mask_bin.shape} file={rec.depth_path}"
+            )
+        K = np.loadtxt(rec.K_path, dtype=np.float32).reshape(3, 3)
 
         sample = {
             "obj_name": rec.obj_name,
