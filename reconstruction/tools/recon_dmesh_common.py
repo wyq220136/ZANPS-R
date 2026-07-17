@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import shutil
 from dataclasses import dataclass
@@ -21,7 +22,6 @@ from recon_utils import (
     load_k,
     load_mask,
     mask_path_for_part_frame,
-    method_models_dir,
     method_object_dir,
     method_pose_ready_dir,
     model_obj_path,
@@ -47,6 +47,15 @@ class Keyframe:
     pose_info: Dict[str, object]
 
 
+def _release_cuda_cache() -> None:
+    try:
+        if "torch" in globals() and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    gc.collect()
+
+
 def _require_base(args: argparse.Namespace, obj: DatasetObject, base_method: str) -> None:
     parts = list_parts(obj)
     base_root = method_pose_ready_dir(Path(args.work_root).resolve(), base_method, args.split, obj.name)
@@ -66,10 +75,14 @@ def _require_base(args: argparse.Namespace, obj: DatasetObject, base_method: str
         from run.recon_sam3d import reconstruct_object
     elif base_method == "hunyuan3d":
         from run.recon_hunyuan3d import reconstruct_object
+    elif base_method == "instantmesh":
+        from run.recon_instantmesh import reconstruct_object
     elif base_method == "sam3d_tsdf":
         from run.recon_sam3d_tsdf import reconstruct_object
     elif base_method == "hunyuan3d_tsdf":
         from run.recon_hunyuan3d_tsdf import reconstruct_object
+    elif base_method == "instantmesh_tsdf":
+        from run.recon_instantmesh_tsdf import reconstruct_object
     else:
         raise ValueError(f"unknown base method: {base_method}")
     reconstruct_object(obj, args)
@@ -115,24 +128,6 @@ def _as_trimesh(mesh_obj):
     )
 
 
-def _copy_converted_tree(src_root: Path, dst_root: Path, overwrite: bool) -> int:
-    count = 0
-    if not src_root.exists():
-        return count
-    for src_obj in src_root.rglob("model.obj"):
-        rel_dir = src_obj.parent.relative_to(src_root)
-        dst_dir = dst_root / rel_dir
-        dst_obj = dst_dir / "model.obj"
-        if dst_obj.exists() and not overwrite:
-            count += 1
-            continue
-        if dst_dir.exists() and overwrite:
-            shutil.rmtree(dst_dir)
-        shutil.copytree(src_obj.parent, dst_dir, dirs_exist_ok=True)
-        count += 1
-    return count
-
-
 def _largest_components(mesh, min_faces: int):
     tm = _trimesh()
     parts = mesh.split(only_watertight=False)
@@ -148,33 +143,71 @@ def _simplify_mesh(mesh, target_faces: int):
     if target_faces <= 0 or len(mesh.faces) <= target_faces:
         return mesh, "not_needed"
     try:
-        out = mesh.simplify_quadric_decimation(face_count=int(target_faces))
-        return _as_trimesh(out), "trimesh_quadric"
-    except TypeError:
-        out = mesh.simplify_quadric_decimation(int(target_faces))
-        return _as_trimesh(out), "trimesh_quadric"
+        try:
+            out = mesh.simplify_quadric_decimation(face_count=int(target_faces))
+        except TypeError:
+            out = mesh.simplify_quadric_decimation(int(target_faces))
+    except (ImportError, ModuleNotFoundError) as exc:
+        if getattr(exc, "name", "") == "fast_simplification" or "fast_simplification" in str(exc):
+            return mesh, "skipped_missing_fast_simplification"
+        raise
+    except AttributeError:
+        return mesh, "skipped_missing_simplify_quadric_decimation"
+    return _as_trimesh(out), "trimesh_quadric"
 
 
-def _preprocess_mesh(base_obj: Path, out_path: Path, args: argparse.Namespace):
+def _remove_degenerate_faces(mesh):
+    if hasattr(mesh, "remove_degenerate_faces"):
+        mesh.remove_degenerate_faces()
+        return mesh
+    if hasattr(mesh, "nondegenerate_faces"):
+        keep = mesh.nondegenerate_faces()
+        mesh.update_faces(keep)
+        return mesh
+    return mesh
+
+
+def _remove_duplicate_faces(mesh):
+    if hasattr(mesh, "remove_duplicate_faces"):
+        mesh.remove_duplicate_faces()
+        return mesh
+    if hasattr(mesh, "unique_faces"):
+        keep = mesh.unique_faces()
+        mesh.update_faces(keep)
+        return mesh
+    return mesh
+
+
+def _remove_unreferenced_vertices(mesh):
+    if hasattr(mesh, "remove_unreferenced_vertices"):
+        mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def _cleanup_mesh_faces(mesh):
+    _remove_degenerate_faces(mesh)
+    _remove_duplicate_faces(mesh)
+    _remove_unreferenced_vertices(mesh)
+    return mesh
+
+
+def _preprocess_mesh(base_obj: Path, out_path: Path | None, args: argparse.Namespace):
     tm = _trimesh()
     mesh = _as_trimesh(tm.load(str(base_obj), force="mesh", process=False))
     before = {"vertices": int(len(mesh.vertices)), "faces": int(len(mesh.faces))}
-    mesh.remove_degenerate_faces()
-    mesh.remove_duplicate_faces()
-    mesh.remove_unreferenced_vertices()
+    _cleanup_mesh_faces(mesh)
     if bool(args.dlmesh_remove_small_components):
         mesh = _largest_components(mesh, int(args.dlmesh_min_component_faces))
     simplify_status = "disabled"
     if int(args.dlmesh_target_faces) > 0:
         mesh, simplify_status = _simplify_mesh(mesh, int(args.dlmesh_target_faces))
-    mesh.remove_degenerate_faces()
-    mesh.remove_duplicate_faces()
-    mesh.remove_unreferenced_vertices()
+    _cleanup_mesh_faces(mesh)
     mesh.fix_normals()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    mesh.export(str(out_path))
     after = {"vertices": int(len(mesh.vertices)), "faces": int(len(mesh.faces))}
-    return mesh, {"before": before, "after": after, "simplify": simplify_status, "output": str(out_path)}
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        mesh.export(str(out_path))
+    return mesh, {"before": before, "after": after, "simplify": simplify_status, "output": str(out_path) if out_path is not None else None}
 
 
 def _load_observation(
@@ -563,9 +596,11 @@ def _optimize_mesh_vertices(
         faces=np.asarray(mesh.faces, dtype=np.int64),
         process=False,
     )
-    out.remove_degenerate_faces()
-    out.remove_unreferenced_vertices()
-    return _as_trimesh(out), {"stage": int(stage_idx), "keyframes": len(keyframes), **last}
+    _cleanup_mesh_faces(out)
+    result = _as_trimesh(out)
+    del observed_obj_sets, opt, verts, verts0, faces, out, tm
+    _release_cuda_cache()
+    return result, {"stage": int(stage_idx), "keyframes": len(keyframes), **last}
 
 
 def _run_dlmesh_refinement(base_obj: Path, out_dir: Path, obj: DatasetObject, part_name: str, args: argparse.Namespace) -> Dict[str, object]:
@@ -574,8 +609,7 @@ def _run_dlmesh_refinement(base_obj: Path, out_dir: Path, obj: DatasetObject, pa
     if device.type != "cuda":
         raise RuntimeError("DLMesh replacement requires CUDA because PyTorch3D/nvdiffrast refinement is GPU-only.")
     out_dir.mkdir(parents=True, exist_ok=True)
-    pre_obj = out_dir / "remesh_preprocessed.obj"
-    mesh, pre_info = _preprocess_mesh(base_obj, pre_obj, args)
+    mesh, pre_info = _preprocess_mesh(base_obj, None, args)
     k = load_k(obj)
     summary: Dict[str, object] = {
         "backend": "remesh_pytorch3d_pose_dlmesh",
@@ -591,7 +625,6 @@ def _run_dlmesh_refinement(base_obj: Path, out_dir: Path, obj: DatasetObject, pa
         "optimize_light": False,
     }
     for round_idx in range(max(1, int(args.dlmesh_outer_iters))):
-        round_dir = ensure_dir(out_dir / f"round_{round_idx:02d}")
         keyframes, reports = _collect_keyframes(obj, part_name, mesh, args, device, round_idx)
         round_summary: Dict[str, object] = {
             "round": int(round_idx),
@@ -599,31 +632,27 @@ def _run_dlmesh_refinement(base_obj: Path, out_dir: Path, obj: DatasetObject, pa
             "reports": reports,
             "stages": [],
         }
-        pose_dir = ensure_dir(round_dir / "poses")
-        for kf in keyframes:
-            np.savetxt(pose_dir / f"{kf.observation.frame}_cam_in_ob.txt", kf.cam_in_ob, fmt="%.8f")
-            np.savetxt(pose_dir / f"{kf.observation.frame}_ob_in_cam.txt", kf.ob_in_cam, fmt="%.8f")
         if not keyframes:
             round_summary["status"] = "skipped_no_keyframes"
             summary["rounds"].append(round_summary)
+            _release_cuda_cache()
             continue
         stage_size = max(1, int(args.dlmesh_stage_size))
         for stage_end in range(stage_size, len(keyframes) + stage_size, stage_size):
             stage_kfs = keyframes[: min(len(keyframes), stage_end)]
             stage_idx = len(round_summary["stages"])
             mesh, stage_info = _optimize_mesh_vertices(mesh, stage_kfs, k, args, device, round_idx, stage_idx)
-            stage_path = round_dir / f"stage_{stage_idx:02d}.obj"
-            mesh.export(str(stage_path))
-            stage_info["model"] = str(stage_path)
             round_summary["stages"].append(stage_info)
             if stage_end >= len(keyframes):
                 break
         round_summary["status"] = "success"
         summary["rounds"].append(round_summary)
+        _release_cuda_cache()
     final_obj = out_dir / "model.obj"
     mesh.export(str(final_obj))
     summary["status"] = "success"
     summary["output_model"] = str(final_obj)
+    _release_cuda_cache()
     return summary
 
 
@@ -633,7 +662,6 @@ def run_dmesh_object(obj: DatasetObject, args: argparse.Namespace, base_method: 
 
     base_pose_root = method_pose_ready_dir(work_root, base_method, args.split, obj.name)
     out_pose_root = ensure_dir(method_pose_ready_dir(work_root, method, args.split, obj.name))
-    out_model_root = ensure_dir(method_models_dir(work_root, method, args.split, obj.name))
 
     parts = list_parts(obj)
     summary = {
@@ -673,7 +701,7 @@ def run_dmesh_object(obj: DatasetObject, args: argparse.Namespace, base_method: 
                 "dlmesh_result": result,
             }
         )
-    _copy_converted_tree(out_pose_root, out_model_root, overwrite=True)
+        _release_cuda_cache()
     write_json(method_object_dir(work_root, method, args.split, obj.name) / "summary.json", summary)
     return summary
 

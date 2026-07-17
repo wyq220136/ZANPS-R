@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import copy
 
 RECON_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_ROOT = RECON_ROOT / "tools"
@@ -13,6 +14,7 @@ import argparse
 from recon_dmesh_common import add_dmesh_args, run_dmesh_object
 from recon_tsdf_common import add_tsdf_args, run_tsdf_object
 from recon_utils import DatasetObject, add_common_args, run_object_pipeline
+from run.recon_sam3d import reconstruct_object as reconstruct_sam3d_object
 
 
 METHOD = "sam3d_tsdf_dmesh"
@@ -27,6 +29,13 @@ def reconstruct_object(obj: DatasetObject, args: argparse.Namespace):
     return dmesh_summary
 
 
+def _stage_args(args: argparse.Namespace, method: str) -> argparse.Namespace:
+    out = copy.copy(args)
+    if str(getattr(args, "coord_dir", "") or "").strip():
+        out.coord_dir = str(Path(args.coord_dir).resolve() / method)
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         "Run SAM3D + TSDF fusion + legacy dmesh-branch DLMesh refinement using shared caches.",
@@ -39,7 +48,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    run_object_pipeline(parse_args(), METHOD, reconstruct_object)
+    args = parse_args()
+    print("[stage 1/3] SAM3D base reconstruction")
+    run_object_pipeline(_stage_args(args, BASE_METHOD), BASE_METHOD, reconstruct_sam3d_object)
+    print("[stage 2/3] TSDF refinement from SAM3D results")
+    run_object_pipeline(
+        _stage_args(args, TSDF_METHOD),
+        TSDF_METHOD,
+        lambda obj, stage_args: run_tsdf_object(obj, stage_args, BASE_METHOD, TSDF_METHOD),
+    )
+    print("[stage 3/3] DLMesh refinement from TSDF results")
+    run_object_pipeline(
+        _stage_args(args, METHOD),
+        METHOD,
+        lambda obj, stage_args: run_dmesh_object(obj, stage_args, TSDF_METHOD, METHOD),
+    )
 
 
 if __name__ == "__main__":

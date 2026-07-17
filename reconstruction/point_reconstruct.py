@@ -6,15 +6,33 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from pytorch3d.transforms import Transform3d
 from scipy.spatial import cKDTree
 import trimesh
 # --------------------------
 # Global configuration
 # --------------------------
-SAM3D_PROJECT_ROOT = "/inspire/qb-dev/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/eccv/sam-3d-objects"
-SAM3D_NOTEBOOK_ROOT = "/inspire/qb-dev/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/eccv/sam-3d-objects/notebook"
-CONFIG_PATH = "/inspire/qb-dev/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/eccv/sam-3d-objects/checkpoints/hf/pipeline.yaml"
+RECON_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(RECON_ROOT)
+SERVER_PROJECT_ROOT = "/inspire/hdd/project/robot-dna/jiangyixuan-CZXS25230137/yuquan"
+
+
+def _resolve_project_dir(name):
+    env_key = f"{name.upper().replace('-', '_')}_ROOT"
+    env_path = os.environ.get(env_key, "").strip()
+    if env_path:
+        return env_path
+    local = os.path.join(REPO_ROOT, name)
+    if os.path.isdir(local):
+        return local
+    return os.path.join(SERVER_PROJECT_ROOT, name)
+
+
+SAM3D_PROJECT_ROOT = _resolve_project_dir("sam-3d-objects")
+SAM3D_NOTEBOOK_ROOT = os.path.join(SAM3D_PROJECT_ROOT, "notebook")
+CONFIG_PATH = os.environ.get(
+    "SAM3D_CONFIG_PATH",
+    os.path.join(SAM3D_PROJECT_ROOT, "checkpoints", "hf", "pipeline.yaml"),
+)
 
 
 USE_UMEYAMA_ALIGNMENT = True
@@ -38,13 +56,11 @@ SAM3D_INTERNAL_TO_EXPORTED_MESH = np.asarray(
 # --------------------------
 # SAM3D inference setup
 # --------------------------
-if SAM3D_PROJECT_ROOT not in sys.path:
-    sys.path.append(SAM3D_PROJECT_ROOT)
-if SAM3D_NOTEBOOK_ROOT not in sys.path:
-    sys.path.append(SAM3D_NOTEBOOK_ROOT)
+for _p in (REPO_ROOT, RECON_ROOT, SAM3D_PROJECT_ROOT, SAM3D_NOTEBOOK_ROOT):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from inference import Inference, load_image, load_single_mask
-from sam3d_objects.pipeline.inference_pipeline_pointmap import camera_to_pytorch3d_camera
 
 from reconstruct import (
     align_mesh_to_camera_frame,
@@ -63,6 +79,20 @@ def get_inference():
     if _INFERENCE is None:
         _INFERENCE = Inference(CONFIG_PATH, compile=False, use_depth_model=False)
     return _INFERENCE
+
+
+def _clear_cuda_after_failure():
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
 
 # /root/.cache/torch/hub/facebookresearch_dinov2_main
 def build_raw_points(
@@ -133,14 +163,27 @@ def build_raw_points(
         used_pointmap = True
     except Exception as e:
         err_msgs.append(str(e))
+        _clear_cuda_after_failure()
         output = None
 
     if output is None:
-        raise RuntimeError(
-            "SAM3D inference failed with real-depth pointmap. "
-            f"frame_mask={mask_path if mask_path else os.path.join(mask_dir, str(mask_index))}, "
-            f"fg={int(np.count_nonzero(mask))}, errs={err_msgs[:2]}"
-        )
+        try:
+            output = inference(image, mask, seed=42, pointmap=None)
+            used_pointmap = False
+            print(
+                "[WARN] SAM3D real-depth pointmap inference failed; "
+                "fallback to RGB/mask-only inference. "
+                f"frame_mask={mask_path if mask_path else os.path.join(mask_dir, str(mask_index))}, "
+                f"fg={int(np.count_nonzero(mask))}, errs={err_msgs[:2]}"
+            )
+        except Exception as e:
+            err_msgs.append(str(e))
+            _clear_cuda_after_failure()
+            raise RuntimeError(
+                "SAM3D inference failed with real-depth pointmap and RGB/mask-only fallback. "
+                f"frame_mask={mask_path if mask_path else os.path.join(mask_dir, str(mask_index))}, "
+                f"fg={int(np.count_nonzero(mask))}, errs={err_msgs[:3]}"
+            ) from e
 
     gs = output["gs"]
     output_mesh = inference._pipeline.postprocess_slat_output(
@@ -155,8 +198,6 @@ def build_raw_points(
 
 
 def depth_to_pointmap(mask, depth, intrinsic):
-    if depth.max() > 50:
-        depth = depth / 1000.0
     depth = depth.astype(np.float32)
 
     h, w = depth.shape
@@ -167,19 +208,19 @@ def depth_to_pointmap(mask, depth, intrinsic):
     z = depth.astype(float)
     x = (xs - cx) * z / max(fx, 1e-8)
     y = (ys - cy) * z / max(fy, 1e-8)
-    pointmap_cam = np.stack([x, y, z], axis=-1).astype(np.float32)
+    pointmap = np.stack([x, y, z], axis=-1).astype(np.float32)
+    invalid = (~np.isfinite(z)) | (z <= 1e-6)
+    pointmap[invalid] = np.nan
 
-    pts = torch.from_numpy(pointmap_cam.reshape(-1, 3))
-    cam_to_p3d = Transform3d().rotate(camera_to_pytorch3d_camera(device="cpu").rotation).to("cpu")
-    pointmap = cam_to_p3d.transform_points(pts).reshape(h, w, 3).cpu().numpy().astype(np.float32)
+    # Match ref_pose/learning/datasets/sam3d_part_dataset.py:
+    # SAM3D's explicit pointmap branch expects PyTorch3D camera coordinates.
+    pointmap[..., 0] *= -1.0
+    pointmap[..., 1] *= -1.0
 
+    valid = np.isfinite(z) & (z > 1e-6)
     if mask is not None:
-        valid = (z > 1e-8) & (mask > 0)
-    else:
-        valid = z > 1e-8
+        valid = valid & (mask > 0)
     valid_count = int(np.count_nonzero(valid))
-
-    pointmap[~valid] = np.nan
     return torch.from_numpy(pointmap), valid_count
 
 

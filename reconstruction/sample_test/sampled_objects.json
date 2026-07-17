@@ -1,0 +1,197 @@
+{
+  "data_root": "/inspire/hdd/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/dataset_train",
+  "split": "test",
+  "strategy": "category_balanced_evenly_spaced",
+  "seed": 2026,
+  "num_requested": 30,
+  "num_available": 235,
+  "num_categories_available": 30,
+  "category_counts_available": {
+    "bottle": 11,
+    "box": 5,
+    "bucket": 7,
+    "camera": 7,
+    "coffeemachine": 10,
+    "dishwasher": 7,
+    "dispenser": 11,
+    "door": 6,
+    "eyeglasses": 10,
+    "faucet": 14,
+    "furniture": 24,
+    "kettle": 5,
+    "keyboard": 7,
+    "laptop": 10,
+    "microwave": 3,
+    "mouse": 1,
+    "oven": 4,
+    "phone": 3,
+    "pot": 5,
+    "printer": 5,
+    "refrigerator": 5,
+    "remote": 9,
+    "safe": 4,
+    "suitcase": 3,
+    "table": 17,
+    "toaster": 4,
+    "toilet": 13,
+    "trashcan": 11,
+    "washingmachine": 3,
+    "window": 11
+  },
+  "category_counts_sampled": {
+    "bottle": 1,
+    "box": 1,
+    "bucket": 1,
+    "camera": 1,
+    "coffeemachine": 1,
+    "dishwasher": 1,
+    "dispenser": 1,
+    "door": 1,
+    "eyeglasses": 1,
+    "faucet": 1,
+    "furniture": 1,
+    "kettle": 1,
+    "keyboard": 1,
+    "laptop": 1,
+    "microwave": 1,
+    "mouse": 1,
+    "oven": 1,
+    "phone": 1,
+    "pot": 1,
+    "printer": 1,
+    "refrigerator": 1,
+    "remote": 1,
+    "safe": 1,
+    "suitcase": 1,
+    "table": 1,
+    "toaster": 1,
+    "toilet": 1,
+    "trashcan": 1,
+    "washingmachine": 1,
+    "window": 1
+  },
+  "objects_by_category": {
+    "bottle": [
+      "bottle_3678"
+    ],
+    "box": [
+      "box_100664"
+    ],
+    "bucket": [
+      "bucket_100477"
+    ],
+    "camera": [
+      "camera_102539"
+    ],
+    "coffeemachine": [
+      "coffeemachine_103123"
+    ],
+    "dishwasher": [
+      "dishwasher_12590"
+    ],
+    "dispenser": [
+      "dispenser_103355"
+    ],
+    "door": [
+      "door_9003"
+    ],
+    "eyeglasses": [
+      "eyeglasses_102569"
+    ],
+    "faucet": [
+      "faucet_1479"
+    ],
+    "furniture": [
+      "furniture_45759"
+    ],
+    "kettle": [
+      "kettle_102753"
+    ],
+    "keyboard": [
+      "keyboard_12968"
+    ],
+    "laptop": [
+      "laptop_10270"
+    ],
+    "microwave": [
+      "microwave_7296"
+    ],
+    "mouse": [
+      "mouse_102272"
+    ],
+    "oven": [
+      "oven_101943"
+    ],
+    "phone": [
+      "phone_103699"
+    ],
+    "pot": [
+      "pot_100051"
+    ],
+    "printer": [
+      "printer_103989"
+    ],
+    "refrigerator": [
+      "refrigerator_10900"
+    ],
+    "remote": [
+      "remote_100997"
+    ],
+    "safe": [
+      "safe_101611"
+    ],
+    "suitcase": [
+      "suitcase_101681"
+    ],
+    "table": [
+      "table_24644"
+    ],
+    "toaster": [
+      "toaster_103545"
+    ],
+    "toilet": [
+      "toilet_102675"
+    ],
+    "trashcan": [
+      "trashcan_102177"
+    ],
+    "washingmachine": [
+      "washingmachine_103425"
+    ],
+    "window": [
+      "window_103050"
+    ]
+  },
+  "objects": [
+    "bottle_3678",
+    "box_100664",
+    "bucket_100477",
+    "camera_102539",
+    "coffeemachine_103123",
+    "dishwasher_12590",
+    "dispenser_103355",
+    "door_9003",
+    "eyeglasses_102569",
+    "faucet_1479",
+    "furniture_45759",
+    "kettle_102753",
+    "keyboard_12968",
+    "laptop_10270",
+    "microwave_7296",
+    "mouse_102272",
+    "oven_101943",
+    "phone_103699",
+    "pot_100051",
+    "printer_103989",
+    "refrigerator_10900",
+    "remote_100997",
+    "safe_101611",
+    "suitcase_101681",
+    "table_24644",
+    "toaster_103545",
+    "toilet_102675",
+    "trashcan_102177",
+    "washingmachine_103425",
+    "window_103050"
+  ]
+}

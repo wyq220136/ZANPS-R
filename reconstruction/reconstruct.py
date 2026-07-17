@@ -5,8 +5,29 @@ import json
 import argparse
 from pathlib import Path
 
-sys.path.append("/inspire/qb-dev/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/eccv/sam-3d-objects")
-sys.path.append("/inspire/qb-dev/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/eccv/sam-3d-objects/notebook")
+RECON_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = RECON_ROOT.parent
+SERVER_PROJECT_ROOT = Path("/inspire/hdd/project/robot-dna/jiangyixuan-CZXS25230137/yuquan")
+
+
+def _resolve_project_dir(name):
+    env_key = f"{name.upper().replace('-', '_')}_ROOT"
+    env_path = os.environ.get(env_key, "").strip()
+    if env_path:
+        return Path(env_path)
+    local = REPO_ROOT / name
+    if local.exists():
+        return local
+    return SERVER_PROJECT_ROOT / name
+
+
+SAM3D_PROJECT_ROOT = _resolve_project_dir("sam-3d-objects")
+SAM3D_NOTEBOOK_ROOT = SAM3D_PROJECT_ROOT / "notebook"
+
+for _p in (REPO_ROOT, RECON_ROOT, SAM3D_PROJECT_ROOT, SAM3D_NOTEBOOK_ROOT):
+    p = str(_p)
+    if _p.exists() and p not in sys.path:
+        sys.path.insert(0, p)
 
 from inference import Inference, load_image, load_single_mask
 import numpy as np
@@ -18,7 +39,10 @@ from sam3d_objects.pipeline.inference_pipeline_pointmap import camera_to_pytorch
 
 WITH_MESH_POSTPROCESS = True
 WITH_TEXTURE_BAKING = True
-CONFIG_PATH = "/inspire/qb-dev/project/robot-dna/jiangyixuan-CZXS25230137/yuquan/eccv/sam-3d-objects/checkpoints/hf/pipeline.yaml"
+CONFIG_PATH = os.environ.get(
+    "SAM3D_CONFIG_PATH",
+    str(SAM3D_PROJECT_ROOT / "checkpoints" / "hf" / "pipeline.yaml"),
+)
 USE_POINTMAP_RECONSTRUCTION = True
 RUN_ICP_WHEN_POINTMAP_USED = False
 

@@ -413,6 +413,42 @@ def _format_process_exit(p: Process) -> str:
     return f"pid={p.pid} exitcode={code}"
 
 
+def _parse_gpu_ids(raw: str) -> List[str]:
+    return [x.strip() for x in str(raw or "").split(",") if x.strip()]
+
+
+def _parse_workers_per_gpu(raw: str, gpus: List[str]) -> List[int]:
+    if not gpus:
+        return []
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    parts = [x.strip() for x in text.split(",") if x.strip()]
+    if len(parts) == 1:
+        counts = [int(parts[0])] * len(gpus)
+    elif len(parts) == len(gpus):
+        counts = [int(x) for x in parts]
+    else:
+        raise ValueError(
+            "--workers-per-gpu must be one integer or have the same "
+            f"number of entries as --gpus ({len(gpus)})."
+        )
+    if any(c < 0 for c in counts):
+        raise ValueError("--workers-per-gpu values must be non-negative.")
+    if sum(counts) <= 0:
+        raise ValueError("At least one worker is required across selected GPUs.")
+    return counts
+
+
+def _interleaved_gpu_slots(gpus: List[str], worker_counts: List[int]) -> List[str]:
+    slots: List[str] = []
+    for idx in range(max(worker_counts)):
+        for gpu_id, count in zip(gpus, worker_counts):
+            if idx < count:
+                slots.append(str(gpu_id))
+    return slots
+
+
 def add_common_args(parser: argparse.ArgumentParser, method: str) -> None:
     parser.add_argument("--data-root", type=str, default="dataset_train", help="Root containing split/object dirs.")
     parser.add_argument("--split", type=str, default="val", help="Dataset split, e.g. val.")
@@ -428,6 +464,12 @@ def add_common_args(parser: argparse.ArgumentParser, method: str) -> None:
     parser.add_argument("--stale-lock-sec", type=int, default=12 * 3600)
     parser.add_argument("--poll-interval-sec", type=float, default=3.0)
     parser.add_argument("--gpus", type=str, default="", help="Comma-separated GPU ids assigned round-robin to workers.")
+    parser.add_argument(
+        "--workers-per-gpu",
+        type=str,
+        default="",
+        help="Optional comma-separated worker counts aligned with --gpus, e.g. 12,5.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--min-mask-pixels", type=int, default=64)
     parser.add_argument("--max-frames", type=int, default=0)
@@ -449,13 +491,28 @@ def run_object_pipeline(args, method: str, worker_fn: Callable[[DatasetObject, a
     if args.reset_coord:
         reset_coord(coord_dir)
     coord = FileCoordinator(coord_dir, objects, stale_lock_sec=args.stale_lock_sec)
-    gpus = [x.strip() for x in args.gpus.split(",") if x.strip()]
+    gpus = _parse_gpu_ids(args.gpus)
+    workers_per_gpu_raw = str(getattr(args, "workers_per_gpu", "") or "").strip()
+    if workers_per_gpu_raw and not gpus:
+        raise ValueError("--workers-per-gpu requires --gpus to be set.")
+    per_gpu_counts = _parse_workers_per_gpu(workers_per_gpu_raw, gpus)
+    if per_gpu_counts:
+        worker_gpu_slots = _interleaved_gpu_slots(gpus, per_gpu_counts)
+        num_workers = len(worker_gpu_slots)
+    else:
+        num_workers = max(1, int(args.num_workers))
+        worker_gpu_slots = [gpus[i % len(gpus)] for i in range(num_workers)] if gpus else []
 
-    print(f"[{now()}] method={method} split={args.split} objects={len(objects)} coord={coord_dir}")
+    print(
+        f"[{now()}] method={method} split={args.split} objects={len(objects)} "
+        f"workers={num_workers} gpus={','.join(gpus) if gpus else 'default'} "
+        f"worker_gpu_slots={','.join(worker_gpu_slots) if worker_gpu_slots else 'default'} "
+        f"coord={coord_dir}"
+    )
 
     def loop(worker_idx: int):
-        if gpus:
-            os.environ["CUDA_VISIBLE_DEVICES"] = gpus[worker_idx % len(gpus)]
+        if worker_gpu_slots:
+            os.environ["CUDA_VISIBLE_DEVICES"] = worker_gpu_slots[worker_idx % len(worker_gpu_slots)]
         worker_id = f"{socket.gethostname()}_pid{os.getpid()}_w{worker_idx}"
         worker_log_dir = ensure_dir(coord_dir / "worker_logs")
         worker_log_path = worker_log_dir / f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', worker_id)}.log"
@@ -505,7 +562,7 @@ def run_object_pipeline(args, method: str, worker_fn: Callable[[DatasetObject, a
             except Exception:
                 pass
 
-    if int(args.num_workers) <= 1:
+    if num_workers <= 1:
         loop(0)
         reports = _read_failure_reports(coord_dir)
         if reports:
@@ -514,7 +571,7 @@ def run_object_pipeline(args, method: str, worker_fn: Callable[[DatasetObject, a
         return
 
     workers: List[Process] = []
-    for i in range(int(args.num_workers)):
+    for i in range(num_workers):
         p = Process(target=loop, args=(i,), daemon=False)
         p.start()
         workers.append(p)

@@ -14,7 +14,7 @@ RECON_ROOT = Path(__file__).resolve().parents[1]
 if str(RECON_ROOT) not in sys.path:
     sys.path.insert(0, str(RECON_ROOT))
 
-from recon_utils import (  # noqa: E402
+from tools.recon_utils import (  # noqa: E402
     DatasetObject,
     backproject,
     list_objects,
@@ -32,16 +32,113 @@ from recon_utils import (  # noqa: E402
 )
 
 
-def load_mesh(path: Path) -> Optional[trimesh.Trimesh]:
+def _sanitize_vertices_faces(vertices: np.ndarray, faces: np.ndarray) -> Tuple[Optional[trimesh.Trimesh], str]:
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    notes = []
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) == 0:
+        return None, "empty_vertices"
+    if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
+        return None, "empty_faces"
+
+    finite_vertices = np.isfinite(vertices).all(axis=1)
+    if not np.all(finite_vertices):
+        old_to_new = np.full(len(vertices), -1, dtype=np.int64)
+        old_to_new[finite_vertices] = np.arange(int(np.sum(finite_vertices)), dtype=np.int64)
+        valid_face_vertices = finite_vertices[faces].all(axis=1)
+        vertices = vertices[finite_vertices]
+        faces = old_to_new[faces[valid_face_vertices]]
+        notes.append("dropped_nonfinite_vertices")
+
+    in_bounds = (faces >= 0).all(axis=1) & (faces < len(vertices)).all(axis=1)
+    if not np.all(in_bounds):
+        faces = faces[in_bounds]
+        notes.append("dropped_out_of_bounds_faces")
+    if len(faces) == 0:
+        return None, "empty_faces_after_filter"
+
+    nondegenerate = (faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & (faces[:, 0] != faces[:, 2])
+    if not np.all(nondegenerate):
+        faces = faces[nondegenerate]
+        notes.append("dropped_degenerate_faces")
+    if len(faces) == 0:
+        return None, "empty_faces_after_filter"
+
+    used = np.zeros(len(vertices), dtype=bool)
+    used[np.unique(faces.reshape(-1))] = True
+    if not np.all(used):
+        old_to_new = np.full(len(vertices), -1, dtype=np.int64)
+        old_to_new[used] = np.arange(int(np.sum(used)), dtype=np.int64)
+        vertices = vertices[used]
+        faces = old_to_new[faces]
+        notes.append("dropped_unreferenced_vertices")
+    if len(vertices) == 0 or len(faces) == 0:
+        return None, "empty_mesh_after_filter"
+
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False), ";".join(notes)
+
+
+def _load_obj_sanitized(path: Path) -> Tuple[Optional[trimesh.Trimesh], str]:
+    vertices = []
+    faces = []
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("v "):
+                    toks = line.strip().split()
+                    if len(toks) >= 4:
+                        try:
+                            vertices.append([float(toks[1]), float(toks[2]), float(toks[3])])
+                        except ValueError:
+                            vertices.append([math.nan, math.nan, math.nan])
+                elif line.startswith("f "):
+                    raw = line.strip().split()[1:]
+                    idxs = []
+                    for tok in raw:
+                        head = tok.split("/", 1)[0]
+                        if not head:
+                            continue
+                        try:
+                            idx = int(head)
+                        except ValueError:
+                            continue
+                        idxs.append(idx - 1 if idx > 0 else len(vertices) + idx)
+                    if len(idxs) >= 3:
+                        for i in range(1, len(idxs) - 1):
+                            faces.append([idxs[0], idxs[i], idxs[i + 1]])
+    except OSError as e:
+        return None, f"read_failed: {type(e).__name__}: {e}"
+    mesh, note = _sanitize_vertices_faces(np.asarray(vertices), np.asarray(faces))
+    return mesh, f"obj_fallback_sanitized{(':' + note) if note else ''}"
+
+
+def load_mesh(path: Path) -> Tuple[Optional[trimesh.Trimesh], str]:
     if not path.exists():
-        return None
-    mesh = trimesh.load(path, force="mesh", process=False)
+        return None, "missing"
+    try:
+        mesh = trimesh.load(path, force="mesh", process=False)
+    except Exception as e:
+        if path.suffix.lower() == ".obj":
+            fallback, note = _load_obj_sanitized(path)
+            if fallback is not None:
+                return fallback, f"trimesh_load_failed:{type(e).__name__};{note}"
+        return None, f"load_failed: {type(e).__name__}: {e}"
     if isinstance(mesh, trimesh.Scene):
-        geoms = [g for g in mesh.geometry.values() if len(g.vertices) and len(g.faces)]
+        geoms = [
+            g
+            for g in mesh.geometry.values()
+            if isinstance(g, trimesh.Trimesh) and len(g.vertices) > 0 and len(g.faces) > 0
+        ]
         mesh = trimesh.util.concatenate(geoms) if geoms else None
-    if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
-        return None
-    return trimesh.Trimesh(vertices=np.asarray(mesh.vertices), faces=np.asarray(mesh.faces), process=False)
+    if not isinstance(mesh, trimesh.Trimesh):
+        if path.suffix.lower() == ".obj":
+            fallback, note = _load_obj_sanitized(path)
+            if fallback is not None:
+                return fallback, f"trimesh_loaded_{type(mesh).__name__};{note}"
+        return None, f"unsupported_geometry:{type(mesh).__name__}"
+    if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        return None, "empty_mesh"
+    return _sanitize_vertices_faces(np.asarray(mesh.vertices), np.asarray(mesh.faces))
 
 
 def sample_surface(mesh: trimesh.Trimesh, n: int) -> np.ndarray:
@@ -93,13 +190,13 @@ def chamfer_and_fscore(cand: trimesh.Trimesh, gt: trimesh.Trimesh, samples: int,
     precision = float(np.mean(d_c2g <= thresh))
     recall = float(np.mean(d_g2c <= thresh))
     f = 0.0 if precision + recall <= 1e-12 else float(2 * precision * recall / (precision + recall))
-    return {"chamfer": chamfer, "fscore": f, "precision": precision, "recall": recall}
+    return {"chamfer": chamfer, "fscore": f}
 
 
 def mesh_quality(mesh: trimesh.Trimesh) -> Dict[str, float]:
     comps = mesh.split(only_watertight=False)
-    edges = mesh.edges_unique_length if len(mesh.edges_unique) else np.asarray([np.nan])
-    area = mesh.area_faces
+    edges = np.asarray(mesh.edges_unique_length, dtype=np.float64) if len(mesh.edges_unique) else np.asarray([np.nan], dtype=np.float64)
+    area = np.asarray(mesh.area_faces, dtype=np.float64)
     degenerate = float(np.mean(area <= 1e-12)) if len(area) else math.nan
     return {
         "vertices": float(len(mesh.vertices)),
@@ -142,42 +239,46 @@ def eval_one_method_object(args, method: str, obj_name: str) -> List[Dict[str, o
     work_root = Path(args.work_root).resolve()
     obj = DatasetObject(data_root=data_root, split=args.split, name=obj_name)
     rows = []
-    parts = list_parts(obj)
+    try:
+        parts = list_parts(obj)
+    except FileNotFoundError as e:
+        return [
+            {
+                "method": method,
+                "object": obj.name,
+                "part": "",
+                "candidate": "",
+                "gt": "",
+                "status": "missing_dataset_input",
+                "error": str(e),
+            }
+        ]
     for part_idx, part_name in enumerate(parts):
         part_model = part_model_name(part_name, part_idx)
         cand_path = model_obj_path(method_pose_ready_dir(work_root, method, args.split, obj.name), part_model)
         gt_path = model_obj_path(obj.gt_models_dir, part_name)
         row = {"method": method, "object": obj.name, "part": part_name, "candidate": str(cand_path), "gt": str(gt_path)}
-        cand = load_mesh(cand_path)
-        gt = load_mesh(gt_path)
+        cand, cand_error = load_mesh(cand_path)
+        gt, gt_error = load_mesh(gt_path)
         if cand is None:
-            row["status"] = "missing_candidate"
+            row["status"] = "missing_candidate" if cand_error == "missing" else "invalid_candidate_mesh"
+            row["error"] = cand_error
             rows.append(row)
             continue
         if gt is None:
-            row["status"] = "missing_gt"
-            row.update(mesh_quality(cand))
+            row["status"] = "missing_gt" if gt_error == "missing" else "invalid_gt_mesh"
+            row["error"] = gt_error
             rows.append(row)
             continue
         try:
             row.update(chamfer_and_fscore(cand, gt, args.samples, args.fscore_thresh))
-            row.update(mesh_quality(cand))
-            frames = []
-            part_dir = obj.masks_dir / part_name
-            if part_dir.is_dir():
-                frames = sorted([p.stem for p in part_dir.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg"}], key=natural_sort_key)
-            if args.max_eval_frames > 0:
-                frames = frames[: args.max_eval_frames]
-            vis_vals = []
-            for frame in frames[:: max(1, args.frame_stride)]:
-                vp = visible_depth_proxy(obj, cand, part_name, frame, args.pose_convention)
-                if np.isfinite(vp["visible_chamfer"]):
-                    vis_vals.append(vp["visible_chamfer"])
-            row["visible_chamfer"] = float(np.mean(vis_vals)) if vis_vals else math.nan
-            row["status"] = "ok"
         except Exception as e:
             row["status"] = "failed"
-            row["error"] = str(e)
+            row["error"] = f"metric_failed: {type(e).__name__}: {e}"
+            rows.append(row)
+            continue
+
+        row["status"] = "ok"
         rows.append(row)
     return rows
 
@@ -185,34 +286,34 @@ def eval_one_method_object(args, method: str, obj_name: str) -> List[Dict[str, o
 def write_tables(rows: List[Dict[str, object]], out_root: Path) -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     detail = out_root / "per_part_metrics.csv"
-    keys = sorted({k for r in rows for k in r.keys()})
+    keys = ["method", "object", "part", "status", "chamfer", "fscore", "candidate", "gt", "error"]
     with detail.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in keys})
 
     methods = sorted({str(r.get("method")) for r in rows})
     summary_rows = []
     for method in methods:
         mr = [r for r in rows if r.get("method") == method and r.get("status") == "ok"]
         item = {"method": method, "count": len(mr)}
-        for key in ("chamfer", "fscore", "visible_chamfer", "components", "degenerate_ratio"):
+        for key in ("chamfer", "fscore"):
             vals = [float(r[key]) for r in mr if key in r and np.isfinite(float(r[key]))]
             item[key] = float(np.mean(vals)) if vals else math.nan
         summary_rows.append(item)
     summary = out_root / "summary_table.csv"
     with summary.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["method", "count", "chamfer", "fscore", "visible_chamfer", "components", "degenerate_ratio"])
+        writer = csv.DictWriter(f, fieldnames=["method", "count", "chamfer", "fscore"])
         writer.writeheader()
         writer.writerows(summary_rows)
     md = out_root / "summary_table.md"
     with md.open("w", encoding="utf-8") as f:
-        f.write("| method | count | chamfer↓ | fscore↑ | visible_chamfer↓ | components↓ | degenerate_ratio↓ |\n")
-        f.write("|---|---:|---:|---:|---:|---:|---:|\n")
+        f.write("| method | count | chamfer↓ | fscore@0.01↑ |\n")
+        f.write("|---|---:|---:|---:|\n")
         for r in summary_rows:
             f.write(
-                f"| {r['method']} | {r['count']} | {r['chamfer']:.6g} | {r['fscore']:.6g} | "
-                f"{r['visible_chamfer']:.6g} | {r['components']:.6g} | {r['degenerate_ratio']:.6g} |\n"
+                f"| {r['method']} | {r['count']} | {r['chamfer']:.6g} | {r['fscore']:.6g} |\n"
             )
 
 

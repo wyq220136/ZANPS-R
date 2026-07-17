@@ -50,7 +50,16 @@ def _import_point_reconstruct():
 
 
 def _copy_temp_result(temp_out: Path, part_model: str, models_root: Path, pose_ready_root: Path, overwrite: bool) -> bool:
-    src = temp_out / part_model / "model.obj"
+    src_dir = temp_out / part_model
+    src = src_dir / "model.obj"
+    if not src.exists():
+        # raw_pose_estimation enumerates masks in the temporary folder. Since this
+        # wrapper reconstructs one part at a time, the temporary output is often
+        # model_0000 even when the dataset part is model_0005, etc.
+        candidates = sorted([p.parent for p in temp_out.glob("model_*/model.obj")])
+        if len(candidates) == 1:
+            src_dir = candidates[0]
+            src = src_dir / "model.obj"
     if not src.exists():
         return False
     for root in (models_root, pose_ready_root):
@@ -59,7 +68,7 @@ def _copy_temp_result(temp_out: Path, part_model: str, models_root: Path, pose_r
         if dst.exists() and not overwrite:
             continue
         dst_dir.mkdir(parents=True, exist_ok=True)
-        for file in (temp_out / part_model).iterdir():
+        for file in src_dir.iterdir():
             if file.is_file():
                 shutil.copy2(file, dst_dir / file.name)
     return True
@@ -90,6 +99,7 @@ def reconstruct_object(obj: DatasetObject, args: argparse.Namespace) -> Dict[str
         rgb_path = find_image(obj.rgb_dir, frame)
         depth_path = find_image(obj.depth_dir, frame)
         mask_path = mask_path_for_part_frame(obj, part_name, frame)
+        pose_root = obj.cam_params_dir / part_name
         if rgb_path is None or depth_path is None or mask_path is None:
             summary["parts"].append({"part": part_name, "status": "skipped", "reason": "missing_rgb_depth_mask"})
             continue
@@ -112,7 +122,7 @@ def reconstruct_object(obj: DatasetObject, args: argparse.Namespace) -> Dict[str
                     mask_dir=str(temp_root / "masks"),
                     inference=inference,
                     save_dir=str(temp_out),
-                    gt_root=None,
+                    gt_root=str(pose_root) if pose_root.is_dir() else None,
                     flat_output=True,
                 )
                 ok = _copy_temp_result(temp_out, part_model, models_root, pose_ready_root, args.overwrite)
